@@ -592,6 +592,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tickets"
+version = "0.1.0"
+dependencies = [
+ "resume",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "tinyvec"
 version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
