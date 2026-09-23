@@ -82,6 +82,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
+name = "counter"
+version = "0.1.0"
+dependencies = [
+ "resume",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -577,18 +589,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "three_steps"
-version = "0.1.0"
-dependencies = [
- "resume",
- "serde_json",
- "tokio",
- "tokio-postgres",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

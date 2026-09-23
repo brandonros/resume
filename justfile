@@ -9,10 +9,10 @@ schema:
         -f sql/004_claim.sql \
         -f sql/005_save_step.sql \
         -f sql/006_finish_run.sql \
-        -f examples/three_steps/001_results.sql
+        -f examples/counter/001_results.sql
 
-three-steps-enqueue:
-    cargo run -p three_steps -- enqueue
+counter-enqueue:
+    cargo run -p counter -- enqueue
 
-three-steps-process:
-    cargo run -p three_steps -- work
+counter-process:
+    cargo run -p counter -- work
