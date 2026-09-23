@@ -47,24 +47,29 @@ async fn three_steps(client: &mut Client, run: &Run) -> Result<()> {
         })
         .await?;
 
-    eprintln!("run {}: result = {output}", run.id);
+    tracing::info!("run {}: result = {output}", run.id);
     Ok(())
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .init();
+
     let (mut client, connection) =
         tokio_postgres::connect(&std::env::var("DATABASE_URL")?, NoTls).await?;
     tokio::spawn(async move {
         if let Err(error) = connection.await {
-            eprintln!("postgres: {error}");
+            tracing::error!("postgres: {error}");
         }
     });
 
     match std::env::args().nth(1).as_deref() {
         Some("enqueue") => {
             let id = resume::enqueue(&client, "three_steps", &json!({"amount": 1})).await?;
-            println!("enqueued run {id}");
+            tracing::info!("enqueued run {id}");
             Ok(())
         }
         Some("work") | None => resume::work(&mut client, "three_steps", 30, three_steps).await,

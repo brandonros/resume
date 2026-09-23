@@ -83,11 +83,11 @@ impl Run {
         {
             let output = row.try_get(0)?;
             tx.commit().await?;
-            eprintln!("run {} step {name}: using saved result", self.id);
+            tracing::info!("run {} step {name}: using saved result", self.id);
             return Ok(output);
         }
 
-        eprintln!("run {} step {name}: executing", self.id);
+        tracing::info!("run {} step {name}: executing", self.id);
         let output = action(&tx).await?;
         let saved = tx
             .query_one(
@@ -97,7 +97,7 @@ impl Run {
             .await?
             .try_get(0)?;
         tx.commit().await?;
-        eprintln!("run {} step {name}: committed", self.id);
+        tracing::info!("run {} step {name}: committed", self.id);
         Ok(saved)
     }
 }
@@ -108,12 +108,12 @@ pub async fn work(
     lease_seconds: i32,
     mut execute: impl AsyncFnMut(&mut Client, &Run) -> Result<()>,
 ) -> Result<()> {
-    eprintln!("{workflow}: worker started");
+    tracing::info!("{workflow}: worker started");
     let mut waiting = false;
     loop {
         let Some(run) = claim(client, workflow, lease_seconds).await? else {
             if !waiting {
-                eprintln!("{workflow}: waiting for work");
+                tracing::info!("{workflow}: waiting for work");
                 waiting = true;
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -121,9 +121,10 @@ pub async fn work(
         };
 
         waiting = false;
-        eprintln!(
+        tracing::info!(
             "run {} attempt {}: claimed (lease {lease_seconds}s)",
-            run.id, run.attempt
+            run.id,
+            run.attempt
         );
         let result = async {
             execute(client, &run).await?;
@@ -132,11 +133,12 @@ pub async fn work(
         .await;
 
         match result {
-            Ok(()) => eprintln!("run {}: finished", run.id),
+            Ok(()) => tracing::info!("run {}: finished", run.id),
             Err(error) => {
-                eprintln!(
+                tracing::warn!(
                     "run {} attempt {}: failed: {error}; retry after lease expires",
-                    run.id, run.attempt
+                    run.id,
+                    run.attempt
                 );
             }
         }
