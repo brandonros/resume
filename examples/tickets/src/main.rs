@@ -1,7 +1,7 @@
 mod mock_issuer;
 
 use mock_issuer::MockIssuer;
-use resume::{Result, Run};
+use resume::{Producer, Result, Run, Worker};
 use serde_json::json;
 use tokio_postgres::{Client, NoTls};
 
@@ -23,8 +23,7 @@ async fn tickets(client: &mut Client, run: &Run, issuer: &mut MockIssuer) -> Res
     .await?;
 
     let ticket = run
-        .step(client, "issue", async |_| {
-            // Intentionally outside the step's transaction.
+        .step_once(client, "issue", async || {
             Ok(json!(issuer.issue(request_id, attendee).await?))
         })
         .await?;
@@ -57,7 +56,7 @@ async fn main() -> Result<()> {
         .init();
 
     let database_url = std::env::var("DATABASE_URL")?;
-    let mut client = connect(&database_url).await?;
+    let client = connect(&database_url).await?;
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("enqueue") => {
@@ -65,22 +64,17 @@ async fn main() -> Result<()> {
                 .next()
                 .ok_or("expected enqueue <request_id> [attendee]")?;
             let attendee = args.next().unwrap_or_else(|| "Ada".into());
-            let id = resume::enqueue(
-                &client,
-                "tickets",
-                &json!({"request_id": request_id, "attendee": attendee}),
-                1,
-            )
-            .await?;
+            let id = Producer::new(&client, "tickets")
+                .enqueue(&json!({"request_id": request_id, "attendee": attendee}), 3)
+                .await?;
             tracing::info!("enqueued run {id} for request {request_id}");
             Ok(())
         }
         Some("work") | None => {
             let mut issuer = MockIssuer::new(connect(&database_url).await?);
-            resume::work(&mut client, "tickets", 30, async |client, run| {
-                tickets(client, run, &mut issuer).await
-            })
-            .await
+            Worker::new(client, "tickets", 30)
+                .run(async |client, run| tickets(client, run, &mut issuer).await)
+                .await
         }
         _ => Err("expected enqueue <request_id> [attendee] or work".into()),
     }

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use resume::{Result, Run};
+use resume::{Producer, Result, Run, Worker};
 use serde_json::json;
 use tokio_postgres::{Client, NoTls};
 
@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let (mut client, connection) =
+    let (client, connection) =
         tokio_postgres::connect(&std::env::var("DATABASE_URL")?, NoTls).await?;
     tokio::spawn(async move {
         if let Err(error) = connection.await {
@@ -68,11 +68,13 @@ async fn main() -> Result<()> {
 
     match std::env::args().nth(1).as_deref() {
         Some("enqueue") => {
-            let id = resume::enqueue(&client, "counter", &json!({"amount": 1}), 1).await?;
+            let id = Producer::new(&client, "counter")
+                .enqueue(&json!({"amount": 1}), 1)
+                .await?;
             tracing::info!("enqueued run {id}");
             Ok(())
         }
-        Some("work") | None => resume::work(&mut client, "counter", 30, counter).await,
+        Some("work") | None => Worker::new(client, "counter", 30).run(counter).await,
         _ => Err("expected enqueue or work".into()),
     }
 }

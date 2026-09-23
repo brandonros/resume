@@ -8,7 +8,8 @@ schema:
         -f sql/003_enqueue.sql \
         -f sql/004_claim.sql \
         -f sql/005_save_step.sql \
-        -f sql/006_finish_run.sql
+        -f sql/006_finish_run.sql \
+        -f sql/007_step_starts.sql
 
 counter-schema:
     psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction -f examples/counter/001_results.sql
