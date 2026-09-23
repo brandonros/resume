@@ -47,7 +47,7 @@ async fn three_steps(client: &mut Client, run: &Run) -> Result<()> {
         })
         .await?;
 
-    println!("run {}: {output}", run.id);
+    eprintln!("run {}: result = {output}", run.id);
     Ok(())
 }
 
@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("enqueue") => {
             let id = resume::enqueue(&client, "three_steps", &json!({"amount": 1})).await?;
-            println!("enqueued {id}");
+            println!("enqueued run {id}");
             Ok(())
         }
         Some("work") | None => resume::work(&mut client, "three_steps", 30, three_steps).await,
