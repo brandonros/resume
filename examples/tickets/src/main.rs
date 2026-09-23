@@ -69,6 +69,7 @@ async fn main() -> Result<()> {
                 &client,
                 "tickets",
                 &json!({"request_id": request_id, "attendee": attendee}),
+                1,
             )
             .await?;
             tracing::info!("enqueued run {id} for request {request_id}");

@@ -10,6 +10,7 @@ begin
     if not found
        or v_run.attempt = 0
        or v_run.attempt is distinct from p_attempt
+       or v_run.failed_at is not null
        or (v_run.finished_at is null and v_run.available_at <= clock_timestamp()) then
         raise exception 'run % claim is no longer valid', p_run_id
             using errcode = '55000';

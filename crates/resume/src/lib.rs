@@ -10,11 +10,21 @@ pub struct Run {
     pub id: i64,
     pub input: Value,
     attempt: i64,
+    max_attempts: i32,
 }
 
-pub async fn enqueue(client: &Client, workflow: &str, input: &Value) -> Result<i64> {
+/// `max_attempts` counts claims, including recovery after a crash.
+pub async fn enqueue(
+    client: &Client,
+    workflow: &str,
+    input: &Value,
+    max_attempts: i32,
+) -> Result<i64> {
     Ok(client
-        .query_one("select resume.enqueue($1, $2)", &[&workflow, input])
+        .query_one(
+            "select resume.enqueue($1, $2, $3)",
+            &[&workflow, input, &max_attempts],
+        )
         .await?
         .try_get(0)?)
 }
@@ -22,7 +32,7 @@ pub async fn enqueue(client: &Client, workflow: &str, input: &Value) -> Result<i
 pub async fn claim(client: &Client, workflow: &str, lease_seconds: i32) -> Result<Option<Run>> {
     let row = client
         .query_opt(
-            "select id, input, attempt from resume.claim($1, $2)",
+            "select id, input, attempt, max_attempts from resume.claim($1, $2)",
             &[&workflow, &lease_seconds],
         )
         .await?;
@@ -32,6 +42,7 @@ pub async fn claim(client: &Client, workflow: &str, lease_seconds: i32) -> Resul
             id: row.try_get("id")?,
             input: row.try_get("input")?,
             attempt: row.try_get("attempt")?,
+            max_attempts: row.try_get("max_attempts")?,
         })
     })
     .transpose()
@@ -63,7 +74,7 @@ impl Run {
         // Check time after acquiring the lock, since acquiring it might have waited.
         let owned: bool = tx
             .query_one(
-                "select attempt = $2 and finished_at is null
+                "select attempt = $2 and finished_at is null and failed_at is null
                         and available_at > clock_timestamp()
                  from resume.runs where id = $1",
                 &[&self.id, &self.attempt],
@@ -122,9 +133,10 @@ pub async fn work(
 
         waiting = false;
         tracing::info!(
-            "run {} attempt {}: claimed (lease {lease_seconds}s)",
+            "run {} attempt {}/{}: claimed (lease {lease_seconds}s)",
             run.id,
-            run.attempt
+            run.attempt,
+            run.max_attempts
         );
         let result = async {
             execute(client, &run).await?;
@@ -135,10 +147,16 @@ pub async fn work(
         match result {
             Ok(()) => tracing::info!("run {}: finished", run.id),
             Err(error) => {
+                let next = if run.attempt < i64::from(run.max_attempts) {
+                    "retry after lease expires"
+                } else {
+                    "attempt limit reached"
+                };
                 tracing::warn!(
-                    "run {} attempt {}: failed: {error}; retry after lease expires",
+                    "run {} attempt {}/{}: failed: {error}; {next}",
                     run.id,
-                    run.attempt
+                    run.attempt,
+                    run.max_attempts
                 );
             }
         }

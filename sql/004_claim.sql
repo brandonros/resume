@@ -14,12 +14,31 @@ begin
         raise exception 'lease seconds must be positive' using errcode = '22023';
     end if;
 
+    -- The final attempt may still finish while its lease is valid.
+    -- Skip locked runs so a busy worker cannot hold up other claims.
+    with exhausted as (
+        select r.id
+        from resume.runs r
+        where r.workflow = p_workflow
+          and r.finished_at is null
+          and r.failed_at is null
+          and r.attempt >= r.max_attempts
+          and r.available_at <= v_now
+        for update skip locked
+    )
+    update resume.runs r
+    set failed_at = clock_timestamp()
+    from exhausted e
+    where r.id = e.id;
+
     return query
     with candidate as (
         select r.id
         from resume.runs r
         where r.workflow = p_workflow
           and r.finished_at is null
+          and r.failed_at is null
+          and r.attempt < r.max_attempts
           and r.available_at <= v_now
         order by r.available_at, r.id
         limit 1

@@ -68,7 +68,7 @@ async fn main() -> Result<()> {
 
     match std::env::args().nth(1).as_deref() {
         Some("enqueue") => {
-            let id = resume::enqueue(&client, "counter", &json!({"amount": 1})).await?;
+            let id = resume::enqueue(&client, "counter", &json!({"amount": 1}), 1).await?;
             tracing::info!("enqueued run {id}");
             Ok(())
         }
