@@ -1,6 +1,6 @@
 -- Returns zero or one run. Commit this claim before executing user code.
 -- The lease covers the whole attempt; saving a step does not extend it.
-create or replace function resume.claim(
+create or replace function resume.claim_run(
     p_workflow text,
     p_lease_seconds integer default 60
 )
@@ -14,13 +14,14 @@ begin
         raise exception 'lease seconds must be positive' using errcode = '22023';
     end if;
 
-    -- The final attempt may still finish while its lease is valid.
+    -- Fail runs whose final attempt's lease has expired. It may still complete while its
+    -- lease is valid. No attempt holds the claim, so this cannot go through fail_run.
     -- Skip locked runs so a busy worker cannot hold up other claims.
     with exhausted as (
         select r.id
         from resume.runs r
         where r.workflow = p_workflow
-          and r.finished_at is null
+          and r.completed_at is null
           and r.failed_at is null
           and r.attempt >= r.max_attempts
           and r.available_at <= v_now
@@ -36,7 +37,7 @@ begin
         select r.id
         from resume.runs r
         where r.workflow = p_workflow
-          and r.finished_at is null
+          and r.completed_at is null
           and r.failed_at is null
           and r.attempt < r.max_attempts
           and r.available_at <= v_now

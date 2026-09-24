@@ -28,7 +28,7 @@ impl Worker {
         tracing::info!("{workflow}: worker started");
         let mut waiting = false;
         loop {
-            let Some(run) = self.claim().await? else {
+            let Some(run) = self.claim_run().await? else {
                 if !waiting {
                     tracing::info!("{}: waiting for work", self.workflow);
                     waiting = true;
@@ -46,12 +46,12 @@ impl Worker {
             );
             let result = async {
                 execute(&mut self.client, &run).await?;
-                self.finish(&run).await
+                self.complete_run(&run).await
             }
             .await;
 
             match result {
-                Ok(()) => tracing::info!("run {}: finished", run.id),
+                Ok(()) => tracing::info!("run {}: completed", run.id),
                 Err(error) => {
                     let next = if run.attempt < i64::from(run.max_attempts) {
                         "retry after lease expires"
@@ -69,11 +69,11 @@ impl Worker {
         }
     }
 
-    async fn claim(&self) -> Result<Option<Run>> {
+    async fn claim_run(&self) -> Result<Option<Run>> {
         let row = self
             .client
             .query_opt(
-                "select id, input, attempt, max_attempts from resume.claim($1, $2)",
+                "select id, idempotency_key, input, attempt, max_attempts from resume.claim_run($1, $2)",
                 &[&self.workflow, &self.lease_seconds],
             )
             .await?;
@@ -81,6 +81,7 @@ impl Worker {
         row.map(|row| {
             Ok(Run {
                 id: row.try_get("id")?,
+                idempotency_key: row.try_get("idempotency_key")?,
                 input: row.try_get("input")?,
                 attempt: row.try_get("attempt")?,
                 max_attempts: row.try_get("max_attempts")?,
@@ -89,9 +90,12 @@ impl Worker {
         .transpose()
     }
 
-    async fn finish(&self, run: &Run) -> Result<()> {
+    async fn complete_run(&self, run: &Run) -> Result<()> {
         self.client
-            .query_one("select resume.finish_run($1, $2)", &[&run.id, &run.attempt])
+            .execute(
+                "select resume.complete_run($1, $2)",
+                &[&run.id, &run.attempt],
+            )
             .await?;
         Ok(())
     }

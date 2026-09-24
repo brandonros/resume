@@ -3,19 +3,23 @@ export PATH := "/Users/brandon/Applications/Postgres.app/Contents/Versions/18/bi
 
 schema:
     psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction \
-        -f sql/001_runs.sql \
-        -f sql/002_steps.sql \
-        -f sql/003_enqueue.sql \
-        -f sql/004_claim.sql \
-        -f sql/005_save_step.sql \
-        -f sql/006_finish_run.sql \
-        -f sql/007_step_starts.sql
+        -f sql/tables/001_runs.sql \
+        -f sql/tables/002_steps.sql \
+        -f sql/tables/003_step_starts.sql \
+        -f sql/functions/001_lock_run.sql \
+        -f sql/functions/002_submit_run.sql \
+        -f sql/functions/003_claim_run.sql \
+        -f sql/functions/004_complete_run.sql \
+        -f sql/functions/005_fail_run.sql \
+        -f sql/functions/006_load_step.sql \
+        -f sql/functions/007_start_step.sql \
+        -f sql/functions/008_save_step.sql
 
 counter-schema:
     psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction -f examples/counter/001_results.sql
 
-counter-enqueue:
-    cargo run -p counter -- enqueue
+counter-submit key:
+    cargo run -p counter -- submit {{quote(key)}}
 
 counter-process:
     cargo run -p counter -- work
@@ -23,8 +27,8 @@ counter-process:
 tickets-schema:
     psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction -f examples/tickets/001_tickets.sql
 
-tickets-enqueue request_id attendee="Ada":
-    cargo run -p tickets -- enqueue {{quote(request_id)}} {{quote(attendee)}}
+tickets-submit request_id attendee="Ada":
+    cargo run -p tickets -- submit {{quote(request_id)}} {{quote(attendee)}}
 
 tickets-process:
     cargo run -p tickets -- work

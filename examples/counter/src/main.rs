@@ -66,15 +66,22 @@ async fn main() -> Result<()> {
         }
     });
 
-    match std::env::args().nth(1).as_deref() {
-        Some("enqueue") => {
-            let id = Producer::new(&client, "counter")
-                .enqueue(&json!({"amount": 1}), 1)
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        Some("submit") => {
+            let key = args.next().ok_or("expected submit <key>")?;
+            let run = Producer::new(&client, "counter")
+                .submit(&key, &json!({"amount": 1}), 1)
                 .await?;
-            tracing::info!("enqueued run {id}");
+            let status = if run.created {
+                "submitted"
+            } else {
+                "already submitted"
+            };
+            tracing::info!("{status} run {} for key {key}", run.id);
             Ok(())
         }
         Some("work") | None => Worker::new(client, "counter", 30).run(counter).await,
-        _ => Err("expected enqueue or work".into()),
+        _ => Err("expected submit <key> or work".into()),
     }
 }

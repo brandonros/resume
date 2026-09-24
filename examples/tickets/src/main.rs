@@ -6,10 +6,8 @@ use serde_json::json;
 use tokio_postgres::{Client, NoTls};
 
 async fn tickets(client: &mut Client, run: &Run, issuer: &mut MockIssuer) -> Result<()> {
-    // Supplied by the caller so duplicate enqueues can identify the same request.
-    let request_id = run.input["request_id"]
-        .as_str()
-        .ok_or("request_id must be a string")?;
+    // The run's idempotency key, so duplicate submissions of a request share one run.
+    let request_id = &run.idempotency_key;
     let attendee = run.input["attendee"]
         .as_str()
         .ok_or("attendee must be a string")?;
@@ -59,15 +57,20 @@ async fn main() -> Result<()> {
     let client = connect(&database_url).await?;
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
-        Some("enqueue") => {
+        Some("submit") => {
             let request_id = args
                 .next()
-                .ok_or("expected enqueue <request_id> [attendee]")?;
+                .ok_or("expected submit <request_id> [attendee]")?;
             let attendee = args.next().unwrap_or_else(|| "Ada".into());
-            let id = Producer::new(&client, "tickets")
-                .enqueue(&json!({"request_id": request_id, "attendee": attendee}), 3)
+            let run = Producer::new(&client, "tickets")
+                .submit(&request_id, &json!({"attendee": attendee}), 3)
                 .await?;
-            tracing::info!("enqueued run {id} for request {request_id}");
+            let status = if run.created {
+                "submitted"
+            } else {
+                "already submitted"
+            };
+            tracing::info!("{status} run {} for request {request_id}", run.id);
             Ok(())
         }
         Some("work") | None => {
@@ -76,6 +79,6 @@ async fn main() -> Result<()> {
                 .run(async |client, run| tickets(client, run, &mut issuer).await)
                 .await
         }
-        _ => Err("expected enqueue <request_id> [attendee] or work".into()),
+        _ => Err("expected submit <request_id> [attendee] or work".into()),
     }
 }

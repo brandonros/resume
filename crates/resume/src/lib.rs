@@ -2,7 +2,7 @@ mod producer;
 mod run;
 mod worker;
 
-pub use producer::Producer;
+pub use producer::{Producer, Submitted};
 pub use run::Run;
 pub use worker::Worker;
 
