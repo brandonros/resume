@@ -209,7 +209,7 @@ impl Worker {
         let permanent = error.is::<Permanent>();
         let ended = client
             .query_one(
-                "select resume.end_attempt($1, $2, $3, $4)",
+                "select resume.fail_attempt($1, $2, $3, $4)",
                 &[&run.id, &run.attempt(), &error.to_string(), &permanent],
             )
             .await

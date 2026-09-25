@@ -9,7 +9,7 @@ use tokio::sync::{Notify, oneshot};
 use tokio_postgres::Client;
 
 use crate::common::{
-    claim, claim_with, complete, connect, end_attempt, run_is, submit, wait_for, workflow,
+    claim, claim_with, complete, connect, fail_attempt, run_is, submit, wait_for, workflow,
 };
 
 /// Submits a run to a workflow of its own and claims it with this lease. Returns the run's ID,
@@ -45,7 +45,7 @@ pub(super) async fn new_claim_rejects_previous_attempt() {
     let (_, second) = claim(&client, &workflow).await.unwrap();
     assert_eq!(second, first + 1);
     assert!(
-        complete(&client, run, first).await.is_err(),
+        complete(&client, run, first, 0).await.is_err(),
         "the replaced attempt completed the run"
     );
 }
@@ -53,11 +53,11 @@ pub(super) async fn new_claim_rejects_previous_attempt() {
 pub(super) async fn attempt_that_handed_back_the_run_cannot_complete_it() {
     let client = connect().await;
     let (run, attempt, _) = claimed(&client, 30.0).await;
-    end_attempt(&client, run, attempt, "boom", false)
+    fail_attempt(&client, run, attempt, "boom", false)
         .await
         .unwrap();
     assert!(
-        complete(&client, run, attempt).await.is_err(),
+        complete(&client, run, attempt, 0).await.is_err(),
         "completed a run it had handed back"
     );
 }
@@ -79,7 +79,7 @@ pub(super) async fn failed_step_keeps_ownership_to_record_the_failure() {
     sleep(0.7).await;
     tx.rollback().await.unwrap();
 
-    end_attempt(&client, run, attempt, "permanent", true)
+    fail_attempt(&client, run, attempt, "permanent", true)
         .await
         .expect("could not record the failure");
 }

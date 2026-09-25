@@ -144,7 +144,7 @@ impl<'a, C: GenericClient> Producer<'a, C> {
         let row = self
             .client
             .query_one(
-                "select run_id, created from resume.submit_run($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                "select run_id, created from resume.submit_workflow($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
                 &[
                     &self.workflow,
                     &self.version,

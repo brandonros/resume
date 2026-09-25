@@ -1,7 +1,9 @@
--- Workflow submission policy: resolves relative times and attaches subject, retry, and
--- failure-handler settings to a newly created run. Both writes share the caller's transaction.
--- Duplicate submissions keep the original settings. Parameters after p_input are optional.
-create or replace function resume.submit_run(
+-- What producers call: submit_run plus the workflow's policy. Turns a retry policy, deadline,
+-- delay or start time, subject and failure handler into a run. The 'resume:' key prefix is
+-- reserved for runs the framework creates itself. Parameters after p_input are optional.
+-- Policy only applies when the run is created; resubmitting a key returns the existing run,
+-- and a different subject is an error, as a different input or version is in submit_run.
+create or replace function resume.submit_workflow(
     p_workflow text,
     p_version text,
     p_idempotency_key text,
@@ -20,11 +22,10 @@ returns table (run_id bigint, created boolean)
 language plpgsql
 as $$
 declare
+    v_now timestamptz := clock_timestamp();
     v_run_id bigint;
     v_created boolean;
     v_subject text;
-    v_now timestamptz := clock_timestamp();
-    v_deadline_at timestamptz := v_now + make_interval(secs => p_deadline_seconds);
 begin
     if p_idempotency_key like 'resume:%' then
         raise exception 'idempotency key % is reserved: keys starting with resume: belong to resume',
@@ -38,29 +39,30 @@ begin
         raise exception 'submit at must be finite and cannot be combined with a delay' using errcode = '22023';
     end if;
 
-    select c.run_id, c.created into v_run_id, v_created
-    from resume.create_run(
+    -- A deadline and a delay both count from submission.
+    select s.run_id, s.created into v_run_id, v_created
+    from resume.submit_run(
         p_workflow, p_version, p_idempotency_key, p_input, p_max_attempts,
-        v_deadline_at, coalesce(p_at, v_now + make_interval(secs => p_delay_seconds))
-    ) c;
+        v_now + make_interval(secs => p_deadline_seconds),
+        coalesce(p_at, v_now + make_interval(secs => p_delay_seconds))
+    ) s;
 
     if v_created then
+        -- Same transaction as the insert, so the run and its policy commit together.
         update resume.runs
         set subject = p_subject,
             retry_delay = make_interval(secs => p_retry_delay_seconds),
             retry_max_delay = make_interval(secs => p_retry_max_delay_seconds),
-            on_failure_workflow = p_on_failure_workflow, on_failure_version = p_on_failure_version
+            on_failure_workflow = p_on_failure_workflow,
+            on_failure_version = p_on_failure_version
         where id = v_run_id;
     else
         select r.subject into v_subject from resume.runs r where r.id = v_run_id;
-
         if v_subject is distinct from p_subject then
             raise exception 'idempotency key % already used with a different subject',
-                p_idempotency_key
-                using errcode = '23505';
+                p_idempotency_key using errcode = '23505';
         end if;
     end if;
-
     return query select v_run_id, v_created;
 end;
 $$;

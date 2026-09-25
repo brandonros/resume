@@ -188,10 +188,7 @@ impl Job {
                 ],
             )
             .await
-            .map_err(|error| match error.as_db_error() {
-                Some(db) if db.code().code() == "RS001" => Permanent(db.message().into()).into(),
-                _ => crate::Error::from(error),
-            })?;
+            .map_err(permanent_if_workflow_changed)?;
         if let Some(reason) = row.try_get::<_, Option<String>>("failed")? {
             tx.commit().await?;
             return Err(RunFailed(reason).into());
@@ -223,16 +220,29 @@ impl Job {
             .try_get(0)?)
     }
 
+    /// Marks the run complete. The database refuses if the attempt's history disagrees with
+    /// the code: a step_once whose error the handler swallowed, or recorded steps this attempt
+    /// never reached. That is a permanent failure, settled like any other step error.
     pub(crate) async fn complete_run(&self) -> Result<()> {
+        let next_position = self.position.load(Ordering::Relaxed);
         self.client
             .lock()
             .await
             .execute(
-                "select resume.complete_run($1, $2)",
-                &[&self.id, &self.attempt],
+                "select resume.complete_run($1, $2, $3)",
+                &[&self.id, &self.attempt, &next_position],
             )
-            .await?;
+            .await
+            .map_err(permanent_if_workflow_changed)?;
         Ok(())
+    }
+}
+
+/// RS001 means the workflow's code and the run's history disagree: never retry.
+fn permanent_if_workflow_changed(error: tokio_postgres::Error) -> crate::Error {
+    match error.as_db_error() {
+        Some(db) if db.code().code() == "RS001" => Permanent(db.message().into()).into(),
+        _ => error.into(),
     }
 }
 

@@ -54,13 +54,22 @@ pub async fn claim_with(
         .map(|row| (row.get(0), row.get(1)))
 }
 
-pub async fn complete(client: &Client, run: i64, attempt: i64) -> Result<u64, Error> {
+/// Completes the run as an attempt whose next step would take `next_position`.
+pub async fn complete(
+    client: &Client,
+    run: i64,
+    attempt: i64,
+    next_position: i32,
+) -> Result<u64, Error> {
     client
-        .execute("select resume.complete_run($1, $2)", &[&run, &attempt])
+        .execute(
+            "select resume.complete_run($1, $2, $3)",
+            &[&run, &attempt, &next_position],
+        )
         .await
 }
 
-pub async fn end_attempt(
+pub async fn fail_attempt(
     client: &Client,
     run: i64,
     attempt: i64,
@@ -69,7 +78,7 @@ pub async fn end_attempt(
 ) -> Result<u64, Error> {
     client
         .execute(
-            "select resume.end_attempt($1, $2, $3, $4)",
+            "select resume.fail_attempt($1, $2, $3, $4)",
             &[&run, &attempt, &error, &permanent],
         )
         .await

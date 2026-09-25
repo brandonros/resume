@@ -8,16 +8,17 @@ use tokio_postgres::{Client, Error};
 
 use crate::common::{claim, connect, make_due, run_is, workflow};
 
-async fn finish(
+/// Ends the attempt through the executor with the given retry delay. Returns whether it retries.
+async fn end(
     client: &Client,
     run: i64,
     attempt: i64,
-    delay: Option<&str>,
-) -> Result<Option<f64>, Error> {
+    retry_after_seconds: Option<f64>,
+) -> Result<bool, Error> {
     client
         .query_one(
-            "select resume.finish_attempt($1, $2, 'failed action', $3::text::interval)",
-            &[&run, &attempt, &delay],
+            "select resume.end_attempt($1, $2, 'failed action', $3)",
+            &[&run, &attempt, &retry_after_seconds],
         )
         .await
         .map(|row| row.get(0))
@@ -39,7 +40,7 @@ pub(super) async fn executor_finish_enforces_ownership_budget_and_deadline() {
     let name = workflow("executor-policy");
     let row = client
         .query_one(
-            "select * from resume.create_run($1, '1', 'key', '{}', 2,
+            "select * from resume.submit_run($1, '1', 'key', '{}', 2,
                 clock_timestamp() + interval '1 hour', clock_timestamp())",
             &[&name],
         )
@@ -49,8 +50,8 @@ pub(super) async fn executor_finish_enforces_ownership_budget_and_deadline() {
     assert!(row.get::<_, bool>("created"));
     let (_, first) = claim(&client, &name).await.unwrap();
 
-    for invalid in ["-1 second", "-infinity"] {
-        assert!(finish(&client, run, first, Some(invalid)).await.is_err());
+    for invalid in [-1.0, f64::NEG_INFINITY, f64::INFINITY] {
+        assert!(end(&client, run, first, Some(invalid)).await.is_err());
     }
     assert!(
         run_is(
@@ -60,10 +61,7 @@ pub(super) async fn executor_finish_enforces_ownership_budget_and_deadline() {
         )
         .await
     );
-    assert_eq!(
-        finish(&client, run, first, Some("2 hours")).await.unwrap(),
-        Some(7200.0)
-    );
+    assert!(end(&client, run, first, Some(7200.0)).await.unwrap());
     assert!(
         run_is(
             &client,
@@ -73,34 +71,25 @@ pub(super) async fn executor_finish_enforces_ownership_budget_and_deadline() {
         )
         .await
     );
-    assert!(finish(&client, run, first, None).await.is_err());
+    assert!(end(&client, run, first, None).await.is_err());
 
     make_due(&client, run).await;
     let (_, second) = claim(&client, &name).await.unwrap();
-    assert!(finish(&client, run, first, None).await.is_err());
-    assert_eq!(
-        finish(&client, run, second, Some("0 seconds"))
-            .await
-            .unwrap(),
-        None
-    );
+    assert!(end(&client, run, first, None).await.is_err());
+    assert!(!end(&client, run, second, Some(0.0)).await.unwrap());
     assert!(run_is(&client, run, "failed_at is not null and attempts_used = 2").await);
     assert!(claim(&client, &name).await.is_none());
 
     let permanent: i64 = client
         .query_one(
-            "select run_id from resume.create_run($1, '1', 'permanent', '{}', 3,
-                null, clock_timestamp())",
+            "select run_id from resume.submit_run($1, '1', 'permanent', '{}', 3)",
             &[&name],
         )
         .await
         .unwrap()
         .get(0);
     let (_, attempt) = claim(&client, &name).await.unwrap();
-    assert_eq!(
-        finish(&client, permanent, attempt, None).await.unwrap(),
-        None
-    );
+    assert!(!end(&client, permanent, attempt, None).await.unwrap());
     assert!(
         run_is(
             &client,
@@ -112,7 +101,7 @@ pub(super) async fn executor_finish_enforces_ownership_budget_and_deadline() {
 
     let scheduled: i64 = client
         .query_one(
-            "select run_id from resume.create_run($1, '1', 'scheduled', '{}', 3,
+            "select run_id from resume.submit_run($1, '1', 'scheduled', '{}', 3,
                 clock_timestamp() + interval '1 hour', clock_timestamp() + interval '2 hours')",
             &[&name],
         )
@@ -154,7 +143,7 @@ pub(super) async fn retry_policy_uses_charged_attempts_and_caps_backoff() {
         assert_eq!(attempt, used + 1);
         let delay: Option<f64> = client
             .query_one(
-                "select resume.end_attempt($1, $2, 'retry me', false)",
+                "select resume.fail_attempt($1, $2, 'retry me', false)",
                 &[&run, &attempt],
             )
             .await
@@ -177,7 +166,7 @@ pub(super) async fn retry_policy_uses_charged_attempts_and_caps_backoff() {
     let (_, attempt) = claim(&client, &name).await.unwrap();
     let terminal: Option<f64> = client
         .query_one(
-            "select resume.end_attempt($1, $2, 'budget spent', false)",
+            "select resume.fail_attempt($1, $2, 'budget spent', false)",
             &[&run, &attempt],
         )
         .await
@@ -290,7 +279,8 @@ pub(super) async fn new_policy_constraints_and_duplicate_identity() {
         "p_on_failure_workflow => 'cleanup'",
         "p_on_failure_workflow => '', p_on_failure_version => '1'",
     ] {
-        let sql = format!("select * from resume.submit_run($1, '1', 'invalid', '{{}}', {invalid})");
+        let sql =
+            format!("select * from resume.submit_workflow($1, '1', 'invalid', '{{}}', {invalid})");
         assert!(
             client.query_one(&sql, &[&name]).await.is_err(),
             "accepted {invalid}"
@@ -322,7 +312,7 @@ pub(super) async fn new_policy_constraints_and_duplicate_identity() {
         "p_on_failure_workflow => '', p_on_failure_version => '1'",
     ] {
         let sql = format!(
-            "select * from resume.submit_run($1, '1', 'key', '{{}}',
+            "select * from resume.submit_workflow($1, '1', 'key', '{{}}',
              p_subject => 'customer:42', {ignored})"
         );
         let duplicate = client.query_one(&sql, &[&name]).await.unwrap();
@@ -332,18 +322,18 @@ pub(super) async fn new_policy_constraints_and_duplicate_identity() {
     }
 
     for sql in [
-        "select * from resume.submit_run($1, '1', 'key', '{}', p_subject => 'customer:43')",
-        "select * from resume.submit_run($1, '2', 'key', '{}', p_subject => 'customer:42')",
-        "select * from resume.submit_run($1, '1', 'key', '42', p_subject => 'customer:42')",
-        "select * from resume.create_run($1, '2', 'key', '{}', 3, null, clock_timestamp())",
-        "select * from resume.create_run($1, '1', 'key', '42', 3, null, clock_timestamp())",
+        "select * from resume.submit_workflow($1, '1', 'key', '{}', p_subject => 'customer:43')",
+        "select * from resume.submit_workflow($1, '2', 'key', '{}', p_subject => 'customer:42')",
+        "select * from resume.submit_workflow($1, '1', 'key', '42', p_subject => 'customer:42')",
+        "select * from resume.submit_run($1, '2', 'key', '{}')",
+        "select * from resume.submit_run($1, '1', 'key', '42')",
     ] {
         let error = client.query_one(sql, &[&name]).await.unwrap_err();
         assert_eq!(error.as_db_error().unwrap().code().code(), "23505");
     }
     let duplicate = client
         .query_one(
-            "select * from resume.create_run($1, '1', 'key', '{}', 9,
+            "select * from resume.submit_run($1, '1', 'key', '{}', 9,
              clock_timestamp() + interval '1 hour', clock_timestamp() + interval '2 hours')",
             &[&name],
         )

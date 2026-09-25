@@ -1,12 +1,12 @@
 -- Every terminal failure path (including deadlines and cancellation) queues the handler
--- in the same transaction. The handler is an ordinary run with three attempts.
+-- in the same transaction. The handler is an ordinary run with three attempts and the
+-- default retry policy, submitted through the executor; its key uses the reserved prefix.
 create or replace function resume.enqueue_failure()
 returns trigger
 language plpgsql
 as $$
 begin
-    insert into resume.runs (workflow, version, idempotency_key, input, max_attempts)
-    values (
+    perform resume.submit_run(
         new.on_failure_workflow, new.on_failure_version,
         format('resume:on_failure:%s', new.id),
         jsonb_build_object('failed_run', new.id, 'error', new.last_error, 'input', new.input),

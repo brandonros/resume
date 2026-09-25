@@ -130,7 +130,7 @@ pub(super) async fn snooze_releases_worker_and_locks_preserves_progress_and_cost
         );
         tx.rollback().await.unwrap();
         assert!(
-            complete(&client, paused, first_attempt).await.is_err(),
+            complete(&client, paused, first_attempt, 0).await.is_err(),
             "a snoozed claim still owned the run"
         );
 

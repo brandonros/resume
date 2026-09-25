@@ -23,14 +23,14 @@ pub async fn timeout_leaves_job_available_and_wait_observes_completion() {
 
     let (id, attempt) = claim(&processor, &workflow).await.unwrap();
     // A retry is not a terminal failure, even though last_error is set.
-    end_attempt(&processor, id, attempt, "temporary", false)
+    fail_attempt(&processor, id, attempt, "temporary", false)
         .await
         .unwrap();
     let (outcome, ()) = tokio::join!(submitted.wait(&client, Duration::from_secs(5)), async {
         tokio::time::sleep(Duration::from_millis(300)).await;
         make_due(&processor, id).await;
         let (_, attempt) = claim(&processor, &workflow).await.unwrap();
-        complete(&processor, id, attempt).await.unwrap();
+        complete(&processor, id, attempt, 0).await.unwrap();
     });
     assert_eq!(outcome.unwrap(), JobOutcome::Completed);
 
@@ -55,7 +55,7 @@ pub async fn wait_reports_failure_cancellation_missing_jobs_and_query_timeout() 
     let producer = Producer::new(&client, &workflow, "1");
     let failed = producer.submit("failed", &json!({})).await.unwrap();
     let (id, attempt) = claim(&client, &workflow).await.unwrap();
-    end_attempt(&client, id, attempt, "invalid input", true)
+    fail_attempt(&client, id, attempt, "invalid input", true)
         .await
         .unwrap();
     assert_eq!(

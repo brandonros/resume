@@ -73,7 +73,7 @@ pub(super) async fn delayed_runs_are_stored_but_only_claimed_when_due() {
             .unwrap();
         let (id, attempt) = claim(&competitor, &name).await.unwrap();
         assert_eq!(id, immediate.id);
-        complete(&competitor, id, attempt).await.unwrap();
+        complete(&competitor, id, attempt, 0).await.unwrap();
 
         // Advance eligibility instead of sleeping five minutes, then race two claimers.
         make_due(&client, submitted.id).await;
@@ -84,7 +84,7 @@ pub(super) async fn delayed_runs_are_stored_but_only_claimed_when_due() {
             [(submitted.id, 1)],
             "two claimers won, or waiting used up an attempt"
         );
-        complete(&client, submitted.id, 1).await.unwrap();
+        complete(&client, submitted.id, 1, 0).await.unwrap();
     }
 }
 
@@ -124,7 +124,7 @@ pub(super) async fn submission_rejects_invalid_schedules_and_zero_is_immediately
     ] {
         let error = client
             .query_one(
-                "select * from resume.submit_run($1, '1', 'key', '{}', p_max_attempts => 1, p_delay_seconds => $2)",
+                "select * from resume.submit_workflow($1, '1', 'key', '{}', p_max_attempts => 1, p_delay_seconds => $2)",
                 &[&name, &delay],
             )
             .await
@@ -138,7 +138,7 @@ pub(super) async fn submission_rejects_invalid_schedules_and_zero_is_immediately
     ] {
         let error = client
             .query_one(
-                "select * from resume.submit_run($1, '1', 'key', '{}', p_max_attempts => 1,
+                "select * from resume.submit_workflow($1, '1', 'key', '{}', p_max_attempts => 1,
                      p_delay_seconds => $2, p_at => $3::text::timestamptz)",
                 &[&name, &delay, &at],
             )
@@ -158,7 +158,7 @@ pub(super) async fn submission_rejects_invalid_schedules_and_zero_is_immediately
 
     let run: i64 = client
         .query_one(
-            "select run_id from resume.submit_run($1, '1', 'key', '{}', p_max_attempts => 1)",
+            "select run_id from resume.submit_workflow($1, '1', 'key', '{}', p_max_attempts => 1)",
             &[&name],
         )
         .await
@@ -229,7 +229,7 @@ pub(super) async fn past_times_are_eligible_and_the_last_schedule_setter_wins() 
 
     for run in [immediate.id, cleared.id] {
         assert_eq!(claim(&client, &name).await, Some((run, 1)));
-        complete(&client, run, 1).await.unwrap();
+        complete(&client, run, 1, 0).await.unwrap();
     }
     assert!(claim(&client, &name).await.is_none());
     assert!(

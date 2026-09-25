@@ -7,7 +7,8 @@ use tokio::sync::oneshot;
 use tokio_postgres::Client;
 
 use crate::common::{
-    claim, claim_with, complete, connect, end_attempt, make_due, pass_deadline, run_is, workflow,
+    claim, claim_with, complete, connect, fail_attempt, make_due, pass_deadline, run_is, wait_for,
+    workflow,
 };
 
 /// Submits a run with this many attempts and a failure handler, `<workflow>-handler` version 2.
@@ -66,7 +67,7 @@ pub(super) async fn failure_and_handler_commit_together() {
     let (_, attempt) = claim(&client, &workflow).await.unwrap();
     let tx = client.transaction().await.unwrap();
     tx.execute(
-        "select resume.end_attempt($1, $2, 'rejected', true)",
+        "select resume.fail_attempt($1, $2, 'rejected', true)",
         &[&run, &attempt],
     )
     .await
@@ -76,11 +77,11 @@ pub(super) async fn failure_and_handler_commit_together() {
     tx.rollback().await.unwrap();
     assert_eq!(handlers(&client, run).await, 0);
 
-    end_attempt(&client, run, attempt, "rejected", true)
+    fail_attempt(&client, run, attempt, "rejected", true)
         .await
         .unwrap();
     assert!(
-        end_attempt(&client, run, attempt, "rejected", true)
+        fail_attempt(&client, run, attempt, "rejected", true)
             .await
             .is_err()
     );
@@ -150,7 +151,7 @@ pub(super) async fn success_retry_and_snooze_do_not_queue_handlers() {
     let client = connect().await;
     let (run, workflow) = submit(&client, "success", 3).await;
     let (_, first) = claim(&client, &workflow).await.unwrap();
-    end_attempt(&client, run, first, "temporary", false)
+    fail_attempt(&client, run, first, "temporary", false)
         .await
         .unwrap();
     assert_eq!(handlers(&client, run).await, 0);
@@ -162,7 +163,7 @@ pub(super) async fn success_retry_and_snooze_do_not_queue_handlers() {
         .unwrap();
     assert_eq!(handlers(&client, run).await, 0);
     let (_, third) = claim(&client, &workflow).await.unwrap();
-    complete(&client, run, third).await.unwrap();
+    complete(&client, run, third, 0).await.unwrap();
     assert_eq!(handlers(&client, run).await, 0);
 }
 
@@ -185,7 +186,7 @@ pub(super) async fn failed_handler_reopens_with_saved_progress() {
         )
         .await
         .unwrap();
-    end_attempt(&client, id, attempt, "refund unavailable", true)
+    fail_attempt(&client, id, attempt, "refund unavailable", true)
         .await
         .unwrap();
     assert_eq!(handlers(&client, id).await, 0);
@@ -200,7 +201,7 @@ pub(super) async fn failed_handler_reopens_with_saved_progress() {
         .await
         .unwrap();
     assert_eq!(saved.get::<_, serde_json::Value>(0), json!(true));
-    complete(&client, id, next).await.unwrap();
+    complete(&client, id, next, 1).await.unwrap();
     assert_eq!(handlers(&client, run).await, 1);
     assert!(reopen(&client, run).await.is_err());
 }
@@ -289,7 +290,7 @@ pub(super) async fn reopen_resolves_an_unknown_step_once_outcome() {
         )
         .await
         .unwrap();
-    end_attempt(&client, run, attempt, "worker died", true)
+    fail_attempt(&client, run, attempt, "worker died", true)
         .await
         .unwrap();
 
@@ -322,4 +323,118 @@ pub(super) async fn reopen_resolves_an_unknown_step_once_outcome() {
         .await
         .unwrap();
     assert_eq!(saved.get::<_, serde_json::Value>(0), json!(42));
+}
+
+/// The error code raised when the run's history disagrees with the workflow's code.
+fn workflow_changed(error: &tokio_postgres::Error) -> bool {
+    error.code().is_some_and(|code| code.code() == "RS001")
+}
+
+pub(super) async fn completion_rejects_unresolved_and_unvisited_steps() {
+    let client = connect().await;
+    let name = workflow("completion");
+
+    // A step whose action errored advanced the cursor before rolling back: no row, no rejection.
+    let rolled_back = Producer::new(&client, &name, "1")
+        .submit("rolled-back", &json!({}))
+        .await
+        .unwrap()
+        .id;
+    let (_, attempt) = claim(&client, &name).await.unwrap();
+    client
+        .batch_execute(&format!(
+            "select resume.begin_step({rolled_back}, {attempt}, 'first', 0, 60);
+             select resume.save_step({rolled_back}, {attempt}, 'first', '1')"
+        ))
+        .await
+        .unwrap();
+    complete(&client, rolled_back, attempt, 2).await.unwrap();
+
+    // A recorded suffix the attempt never reached was never validated: reject it.
+    let short = Producer::new(&client, &name, "1")
+        .submit("short", &json!({}))
+        .await
+        .unwrap()
+        .id;
+    let (_, first) = claim(&client, &name).await.unwrap();
+    client
+        .batch_execute(&format!(
+            "select resume.begin_step({short}, {first}, 'first', 0, 60);
+             select resume.save_step({short}, {first}, 'first', '1');
+             select resume.begin_step({short}, {first}, 'second', 1, 60);
+             select resume.save_step({short}, {first}, 'second', '2')"
+        ))
+        .await
+        .unwrap();
+    fail_attempt(&client, short, first, "temporary", false)
+        .await
+        .unwrap();
+    make_due(&client, short).await;
+    let (_, second) = claim(&client, &name).await.unwrap();
+    client
+        .execute(
+            "select resume.begin_step($1, $2, 'first', 0, 60)",
+            &[&short, &second],
+        )
+        .await
+        .unwrap();
+    let error = complete(&client, short, second, 1).await.unwrap_err();
+    assert!(workflow_changed(&error), "{error}");
+    let message = error.as_db_error().unwrap().message();
+    assert!(message.contains("second"), "{message}");
+    assert!(run_is(&client, short, "completed_at is null and failed_at is null").await);
+    complete(&client, short, second, 2).await.unwrap();
+
+    // A step_once whose error the handler swallowed: the run fails naming the step, an
+    // operator resolves it, and the next attempt replays the supplied output and completes.
+    let swallowed = Producer::new(&client, &name, "1")
+        .submit("swallowed", &json!({}))
+        .await
+        .unwrap()
+        .id;
+    let (stop, shutdown) = oneshot::channel();
+    let worker = Worker::new(connect().await, &name, "1")
+        .poll_interval(Duration::from_millis(10))
+        .run(
+            async {
+                let _ = shutdown.await;
+            },
+            async |run| {
+                let _ = run
+                    .step_once("send", async || Err("vendor timed out".into()))
+                    .await;
+                Ok(())
+            },
+        );
+    let observer = async {
+        wait_for(&client, swallowed, "failed_at is not null").await;
+        let status = client
+            .query_one(
+                "select r.last_error, r.needs_resolution, s.status
+                 from resume.run_status r join resume.step_status s on s.run_id = r.id
+                 where r.id = $1 and s.key = 'send'",
+                &[&swallowed],
+            )
+            .await
+            .unwrap();
+        assert!(status.get::<_, String>(0).contains("send"));
+        assert!(status.get::<_, bool>(1));
+        assert_eq!(status.get::<_, String>(2), "unknown");
+        client
+            .execute("select resume.reopen_run($1, 'send', '42')", &[&swallowed])
+            .await
+            .unwrap();
+        wait_for(&client, swallowed, "completed_at is not null").await;
+        assert!(
+            run_is(
+                &client,
+                swallowed,
+                "(select output from resume.steps s where s.run_id = runs.id and s.key = 'send') = '42'"
+            )
+            .await
+        );
+        stop.send(()).unwrap();
+    };
+    let (result, ()) = tokio::join!(worker, observer);
+    result.unwrap();
 }

@@ -1,7 +1,7 @@
 # The PostgreSQL server, without a database name; the Postgres tools must be on PATH.
 server := env("RESUME_SERVER", "postgresql://localhost:5432")
 export DATABASE_URL := env("DATABASE_URL", server + "/resume")
-executor := "sql/executor/tables/*.sql sql/executor/functions/*.sql"
+executor := "sql/executor/tables/*.sql sql/executor/functions/*.sql sql/executor/views/*.sql"
 workflow := "sql/workflow/tables/*.sql sql/workflow/functions/*.sql sql/workflow/views/*.sql"
 schema := executor + " " + workflow
 
@@ -26,7 +26,7 @@ check:
 # Installs or refreshes the inspection views on an existing schema.
 views:
     psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction \
-        $(printf ' -f %s' sql/workflow/views/*.sql)
+        $(printf ' -f %s' sql/executor/views/*.sql sql/workflow/views/*.sql)
 
 # For operators: after checking the vendor, record an interrupted step_once step's output and
 # continue the run, e.g. just resolve-step 7 send_welcome_email 42
