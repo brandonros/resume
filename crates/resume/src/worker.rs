@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use tokio_postgres::Client;
 
-use crate::{Result, Run};
+use crate::{Result, Run, RunFailed};
 
 pub struct Worker {
     client: Client,
@@ -53,7 +53,9 @@ impl Worker {
             match result {
                 Ok(()) => tracing::info!("run {}: completed", run.id),
                 Err(error) => {
-                    let next = if run.attempt < i64::from(run.max_attempts) {
+                    let next = if error.downcast_ref::<RunFailed>().is_some() {
+                        "run failed"
+                    } else if run.attempt < i64::from(run.max_attempts) {
                         "retry after lease expires"
                     } else {
                         "attempt limit reached"
