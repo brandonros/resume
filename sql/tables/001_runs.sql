@@ -6,6 +6,9 @@ create table resume.runs (
     -- Supplied by the producer. Submitting the same key again returns this run.
     idempotency_key text not null check (idempotency_key <> ''),
     input jsonb not null,
+    -- The record this run changes, such as 'customer:42'. step_latest runs only in the newest
+    -- run of the workflow with the same subject.
+    subject text check (subject <> ''),
     -- Increases with every claim and identifies which claim owns the run.
     attempt bigint not null default 0 check (attempt >= 0),
     -- Claims that do not count against max_attempts: those a stopping worker gave back, and
@@ -27,6 +30,8 @@ create table resume.runs (
     check (completed_at is null or failed_at is null),
     unique (workflow, idempotency_key)
 );
+
+create index runs_subject on resume.runs (workflow, subject, id) where subject is not null;
 
 create index runs_available on resume.runs (workflow, available_at, id)
     where completed_at is null and failed_at is null;

@@ -6,7 +6,8 @@ create or replace function resume.submit_run(
     p_input jsonb,
     p_max_attempts integer default 1,
     p_retry_delay_seconds double precision default 1,
-    p_retry_max_delay_seconds double precision default 60
+    p_retry_max_delay_seconds double precision default 60,
+    p_subject text default null
 )
 returns table (run_id bigint, created boolean)
 language plpgsql
@@ -15,10 +16,10 @@ declare
     v_run resume.runs;
 begin
     insert into resume.runs (
-        workflow, idempotency_key, input, max_attempts, retry_delay, retry_max_delay
+        workflow, idempotency_key, input, subject, max_attempts, retry_delay, retry_max_delay
     )
     values (
-        p_workflow, p_idempotency_key, p_input, p_max_attempts,
+        p_workflow, p_idempotency_key, p_input, p_subject, p_max_attempts,
         make_interval(secs => p_retry_delay_seconds),
         make_interval(secs => p_retry_max_delay_seconds)
     )
@@ -30,7 +31,7 @@ begin
         select * into v_run from resume.runs r
         where r.workflow = p_workflow and r.idempotency_key = p_idempotency_key;
 
-        if v_run.input is distinct from p_input then
+        if v_run.input is distinct from p_input or v_run.subject is distinct from p_subject then
             raise exception 'idempotency key % already used with different input', p_idempotency_key
                 using errcode = '23505';
         end if;

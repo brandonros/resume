@@ -3,7 +3,7 @@ use std::time::Duration;
 use resume::Result;
 use tokio_postgres::Client;
 
-use crate::rng::Rng;
+use harness::Rng;
 
 /// Vendor calls a fault can target.
 pub const CALLS: [&str; 7] = [

@@ -202,6 +202,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness"
+version = "0.1.0"
+dependencies = [
+ "resume",
+ "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "hmac"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -321,6 +330,7 @@ dependencies = [
 name = "onboard"
 version = "0.1.0"
 dependencies = [
+ "harness",
  "resume",
  "serde_json",
  "tokio",
@@ -427,6 +437,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "provision"
+version = "0.1.0"
+dependencies = [
+ "harness",
+ "resume",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -601,6 +624,19 @@ dependencies = [
  "unicode-bidi",
  "unicode-normalization",
  "unicode-properties",
+]
+
+[[package]]
+name = "subscription"
+version = "0.1.0"
+dependencies = [
+ "harness",
+ "resume",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

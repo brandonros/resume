@@ -93,6 +93,47 @@ impl Run {
         .await
     }
 
+    /// For a change that a newer request replaces, such as setting a customer's plan. The
+    /// action runs only if no newer run of this workflow has the same subject (see
+    /// `Producer::submit_for`); otherwise the step returns None and saves nothing, because a
+    /// newer run makes the change. The subject stays locked until the step commits, so a newer
+    /// run's step waits and applies after this one.
+    pub async fn step_latest(
+        &self,
+        client: &mut Client,
+        idempotency_key: &str,
+        action: impl AsyncFnOnce(&Transaction<'_>) -> Result<Value>,
+    ) -> Result<Option<Value>> {
+        async {
+            let (tx, existing, _) = self.begin_step(client, idempotency_key).await?;
+            if let Some(output) = existing {
+                tx.commit().await?;
+                tracing::info!("using saved result");
+                return Ok(Some(output));
+            }
+
+            let latest: bool = tx
+                .query_one("select resume.lock_subject($1)", &[&self.id])
+                .await?
+                .try_get(0)?;
+            if !latest {
+                // Nothing to keep: a replay checks again and finds the same newer run.
+                tx.rollback().await?;
+                tracing::info!("superseded by a newer run");
+                return Ok(None);
+            }
+
+            tracing::info!("executing");
+            let output = self.timed(idempotency_key, action(&tx)).await?;
+            let saved = self.save_step(&tx, idempotency_key, &output).await?;
+            tx.commit().await?;
+            tracing::info!("committed");
+            Ok(Some(saved))
+        }
+        .instrument(step_span(idempotency_key))
+        .await
+    }
+
     /// For external effects that must not repeat, such as a vendor without idempotency.
     /// The action runs at most once per run. If an attempt dies or times out after starting it
     /// and before saving its result, the outcome is unknown: the run fails instead of calling

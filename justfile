@@ -3,7 +3,7 @@ export DATABASE_URL := server + "/resume"
 export PATH := "/Users/brandon/Applications/Postgres.app/Contents/Versions/18/bin:" + env("PATH")
 
 # Drops and recreates the resume database with every schema.
-reset: && schema counter-schema onboard-schema tickets-schema
+reset: && schema counter-schema onboard-schema provision-schema subscription-schema tickets-schema
     dropdb --if-exists --force --maintenance-db "{{server}}/postgres" resume
     createdb --maintenance-db "{{server}}/postgres" resume
 
@@ -67,6 +67,28 @@ onboard-show:
             from resume.runs r where r.workflow = 'onboard' order by r.id" \
         -c "select * from vendors.charges order by id" \
         -c "select * from vendors.emails order by id"
+
+provision-schema:
+    psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction -f examples/provision/001_provision.sql
+
+# Clears the provision data, then has workers race to create VMs for requests across teams,
+# under a per-team quota. Pass "unlocked" to drop the lock and watch teams go over quota.
+provision-race teams="3" requests="50" workers="20" lock="locked":
+    cargo run -q -p provision -- race {{teams}} {{requests}} {{workers}} {{lock}}
+
+provision-check:
+    cargo run -q -p provision -- check
+
+subscription-schema:
+    psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction -f examples/subscription/001_subscription.sql
+
+# Clears the subscription data, then has customers change plans repeatedly while workers apply
+# the changes with step_latest. Pass "step" to use a plain step and watch older plans win.
+subscription-race customers="20" changes="10" workers="10" mode="step_latest":
+    cargo run -q -p subscription -- race {{customers}} {{changes}} {{workers}} {{mode}}
+
+subscription-check:
+    cargo run -q -p subscription -- check
 
 tickets-schema:
     psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction -f examples/tickets/001_tickets.sql

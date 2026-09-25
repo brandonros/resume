@@ -56,10 +56,30 @@ impl<'a> Producer<'a> {
     /// Returns the run for `idempotency_key`, creating it if needed. Reusing a key with
     /// different input is an error. The retry policy only applies when the run is created.
     pub async fn submit(&self, idempotency_key: &str, input: &Value) -> Result<Submitted> {
+        self.submit_run(idempotency_key, input, None).await
+    }
+
+    /// Like `submit`, for a run that changes `subject`, such as "customer:42". Its
+    /// `step_latest` steps run only if no newer run of this workflow has the same subject.
+    pub async fn submit_for(
+        &self,
+        subject: &str,
+        idempotency_key: &str,
+        input: &Value,
+    ) -> Result<Submitted> {
+        self.submit_run(idempotency_key, input, Some(subject)).await
+    }
+
+    async fn submit_run(
+        &self,
+        idempotency_key: &str,
+        input: &Value,
+        subject: Option<&str>,
+    ) -> Result<Submitted> {
         let row = self
             .client
             .query_one(
-                "select run_id, created from resume.submit_run($1, $2, $3, $4, $5, $6)",
+                "select run_id, created from resume.submit_run($1, $2, $3, $4, $5, $6, $7)",
                 &[
                     &self.workflow,
                     &idempotency_key,
@@ -67,6 +87,7 @@ impl<'a> Producer<'a> {
                     &self.retry.max_attempts,
                     &self.retry.delay.as_secs_f64(),
                     &self.retry.max_delay.as_secs_f64(),
+                    &subject,
                 ],
             )
             .await?;

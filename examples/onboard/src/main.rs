@@ -1,6 +1,5 @@
 mod chaos;
 mod mock_vendors;
-mod rng;
 
 use std::time::Duration;
 
