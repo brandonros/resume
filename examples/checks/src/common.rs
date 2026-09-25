@@ -29,7 +29,7 @@ pub async fn submit(client: &Client, workflow: &str) -> i64 {
         .id
 }
 
-/// Claims a run of version 1 with a 60 second lease. Returns its ID and attempt.
+/// Sweeps expired runs, then claims a run of version 1 with a 60 second lease. Returns its ID and attempt.
 pub async fn claim(client: &Client, workflow: &str) -> Option<(i64, i64)> {
     claim_with(client, workflow, "1", 60.0).await
 }
@@ -40,6 +40,10 @@ pub async fn claim_with(
     version: &str,
     lease_seconds: f64,
 ) -> Option<(i64, i64)> {
+    client
+        .execute("select resume.expire_runs($1)", &[&workflow])
+        .await
+        .unwrap();
     client
         .query_opt(
             "select id, attempt from resume.claim_run($1, $2, $3)",
@@ -106,7 +110,7 @@ pub async fn make_due(client: &Client, run: i64) {
         .unwrap();
 }
 
-/// Moves the run's deadline into the past, and makes it eligible so a claim sweeps it.
+/// Moves the run's deadline into the past, and makes it eligible so expiry cleanup can fail it.
 pub async fn pass_deadline(client: &Client, run: i64) {
     client
         .execute(

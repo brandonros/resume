@@ -15,7 +15,7 @@ declare
 begin
     v_run := resume.lock_run(p_run_id, p_attempt);
 
-    if p_permanent or v_run.attempt - v_run.released >= v_run.max_attempts then
+    if p_permanent or v_run.attempts_used >= v_run.max_attempts then
         update resume.runs set failed_at = clock_timestamp(), last_error = p_error
         where id = p_run_id;
         return null;
@@ -25,9 +25,9 @@ begin
     -- of it so runs that failed together do not all retry at the same moment.
     v_delay := least(
         v_run.retry_max_delay,
-        v_run.retry_delay * power(2, least(v_run.attempt - v_run.released - 1, 30))
+        v_run.retry_delay * power(2, least(v_run.attempts_used - 1, 30))
     ) * (0.5 + random() / 2);
-    -- Wake for an earlier deadline so the claim sweep can fail the run on time.
+    -- Wake for an earlier deadline so expiry cleanup can fail the run on time.
     update resume.runs
     set available_at = least(clock_timestamp() + v_delay, deadline_at),
         leased = false,

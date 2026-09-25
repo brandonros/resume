@@ -3,7 +3,7 @@ mod mock_vendor;
 use std::time::Duration;
 
 use mock_vendor::MockVendor;
-use resume::{Permanent, Producer, Result, Run, Worker, shutdown_signal};
+use resume::{Job, Permanent, Producer, Result, Worker, shutdown_signal};
 use serde_json::json;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -11,7 +11,7 @@ use tokio::task::JoinSet;
 const VERSION: &str = "1";
 const WORKFLOWS: [&str; 2] = ["checkout", "checkout_failure"];
 
-async fn checkout(run: &Run, vendor: &mut MockVendor) -> Result<()> {
+async fn checkout(run: &Job, vendor: &mut MockVendor) -> Result<()> {
     let order = run.input["order"].as_str().ok_or("missing order")?;
     run.step("charge", async |_| {
         vendor.apply(order, "payment", "charge").await?;
@@ -31,7 +31,7 @@ async fn checkout(run: &Run, vendor: &mut MockVendor) -> Result<()> {
     Ok(())
 }
 
-async fn undo(run: &Run, vendor: &mut MockVendor, refund: bool) -> Result<()> {
+async fn undo(run: &Job, vendor: &mut MockVendor, refund: bool) -> Result<()> {
     let args = &run.input["input"];
     let order = args["order"].as_str().ok_or("missing original order")?;
     let (kind, action) = if refund {
@@ -55,7 +55,7 @@ async fn undo(run: &Run, vendor: &mut MockVendor, refund: bool) -> Result<()> {
     Ok(())
 }
 
-async fn notify_failure(run: &Run) -> Result<()> {
+async fn notify_failure(run: &Job) -> Result<()> {
     let failed_run = run.input["failed_run"]
         .as_i64()
         .ok_or("missing failed run")?;

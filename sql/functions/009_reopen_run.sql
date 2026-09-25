@@ -48,7 +48,7 @@ begin
     end if;
 
     update resume.runs
-    set failed_at = null, cancelled_at = null, deadline_at = null, released = attempt,
+    set failed_at = null, cancelled_at = null, deadline_at = null, attempts_used = 0,
         leased = false, available_at = clock_timestamp()
     where id = p_run_id;
 end;

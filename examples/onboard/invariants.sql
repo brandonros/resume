@@ -31,8 +31,8 @@ vendor as (
 select format('run %s is still pending', id)
 from runs where completed_at is null and failed_at is null
 union all
-select format('run %s used %s of %s attempts', id, attempt - released, max_attempts)
-from runs where attempt - released > max_attempts
+select format('run %s used %s of %s attempts', id, attempts_used, max_attempts)
+from runs where attempts_used > max_attempts
 union all
 select format('failed run %s has no last_error', id)
 from runs where failed_at is not null and last_error is null

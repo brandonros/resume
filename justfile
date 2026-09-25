@@ -113,3 +113,10 @@ checkout-show:
             where workflow like 'checkout%' order by id" \
         -c "select * from checkout.events order by id" \
         -c "select * from checkout.notifications order by failed_run"
+
+# Submit a job and wait for its outcome, with a caller-side timeout in milliseconds.
+waiting-submit key mode="success" timeout_ms="5000":
+    cargo run -p waiting -- submit {{quote(key)}} {{quote(mode)}} {{quote(timeout_ms)}}
+
+waiting-process:
+    cargo run -p waiting -- work

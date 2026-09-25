@@ -132,9 +132,26 @@ pub(super) async fn completed_step_replays_its_output() {
         .await
         .unwrap();
 
+    // A saved result may replay after the deadline, and replay must renew the lease.
+    client
+        .execute(
+            "update resume.runs set deadline_at = clock_timestamp(),
+             available_at = clock_timestamp() + interval '30 seconds' where id = $1",
+            &[&run],
+        )
+        .await
+        .unwrap();
     assert_eq!(
         begin_step(&client, run, attempt, "once").await,
         Some(json!({"n": 1}))
+    );
+    assert!(
+        run_is(
+            &client,
+            run,
+            "failed_at is null and available_at < clock_timestamp() + interval '2 seconds'"
+        )
+        .await
     );
 }
 

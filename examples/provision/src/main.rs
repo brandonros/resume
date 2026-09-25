@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use harness::{Pool, check_invariants};
 use mock_cloud::Cloud;
 use resume::{
-    Permanent, Producer, Result, RetryPolicy, Run, Worker, lock_resource, shutdown_signal,
+    Job, Permanent, Producer, Result, RetryPolicy, Worker, lock_resource, shutdown_signal,
 };
 use serde_json::json;
 use tokio_postgres::Client;
@@ -18,7 +18,7 @@ const LEASE: Duration = Duration::from_secs(5);
 const STEP_TIMEOUT: Duration = Duration::from_secs(3);
 const INVARIANTS: &str = include_str!("../invariants.sql");
 
-async fn provision(run: &Run, cloud: &mut Cloud, locked: bool) -> Result<()> {
+async fn provision(run: &Job, cloud: &mut Cloud, locked: bool) -> Result<()> {
     let team = run.input["team"].as_str().ok_or("team must be a string")?;
     let request_id = &run.idempotency_key;
 

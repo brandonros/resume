@@ -1,9 +1,11 @@
 //! Runnable regression scenarios against a fresh PostgreSQL database. Run with `just check`.
 mod common;
+mod expiry;
 mod ownership;
 mod recovery;
 mod scheduling;
 mod snooze;
+mod waiting;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -16,6 +18,7 @@ async fn main() {
         };
     }
 
+    check!(expiry::cleanup_is_bounded_skips_locks_and_claims_ignore_unswept_runs);
     check!(ownership::new_claim_rejects_previous_attempt);
     check!(ownership::attempt_that_handed_back_the_run_cannot_complete_it);
     check!(ownership::failed_step_keeps_ownership_to_record_the_failure);
@@ -42,5 +45,7 @@ async fn main() {
     check!(recovery::reserved_handler_keys_cannot_be_submitted);
     check!(recovery::reopen_resolves_an_unknown_step_once_outcome);
     check!(recovery::worker_exhaustion_queues_handler_without_step_output);
-    println!("All 26 checks passed.");
+    check!(waiting::timeout_leaves_job_available_and_wait_observes_completion);
+    check!(waiting::wait_reports_failure_cancellation_missing_jobs_and_query_timeout);
+    println!("All 29 checks passed.");
 }

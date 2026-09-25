@@ -1,11 +1,13 @@
+mod job;
 mod producer;
 mod worker;
 
 use std::fmt;
 use std::time::Duration;
 
-pub use producer::{Producer, RetryPolicy, Submitted};
-pub use worker::{Run, Worker, lock_resource, shutdown_signal};
+pub use job::{Job, JobHandle, JobOutcome, lock_resource};
+pub use producer::{Producer, RetryPolicy};
+pub use worker::{Worker, shutdown_signal};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;

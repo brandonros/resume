@@ -1,0 +1,10 @@
+[package]
+name = "waiting"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+harness = { path = "../harness" }
+resume = { path = "../../crates/resume" }
+serde_json.workspace = true
+tokio.workspace = true

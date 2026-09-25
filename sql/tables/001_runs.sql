@@ -6,7 +6,7 @@ create table resume.runs (
     -- Supplied by the producer. Submitting the same key again returns this run.
     idempotency_key text not null check (idempotency_key <> ''),
     input jsonb not null,
-    -- The record this run changes, such as 'customer:42'. Run::is_latest says whether a newer
+    -- The record this run changes, such as 'customer:42'. Job::is_latest says whether a newer
     -- run of the workflow has the same subject.
     subject text check (subject <> ''),
     -- Only workers of this version may claim the run.
@@ -15,8 +15,8 @@ create table resume.runs (
     deadline_at timestamptz,
     -- Increases with every claim and identifies which claim owns the run.
     attempt bigint not null default 0 check (attempt >= 0),
-    -- Claims excluded from max_attempts: shutdown, snooze, and claims before reopening.
-    released integer not null default 0 check (released >= 0),
+    -- Claims charged against max_attempts. Release refunds one; reopening resets the budget.
+    attempts_used bigint not null default 0 check (attempts_used >= 0),
     max_attempts integer not null default 1 check (max_attempts > 0),
     -- The wait after a failed attempt starts at retry_delay and doubles, up to retry_max_delay.
     retry_delay interval not null default '1 second' check (retry_delay > interval '0'),

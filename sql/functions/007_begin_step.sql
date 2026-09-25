@@ -24,10 +24,8 @@ begin
     if v_run.available_at <= clock_timestamp() then
         raise exception 'run % lease expired', p_run_id using errcode = '55000';
     end if;
-    update resume.runs r
-    set available_at = clock_timestamp() + make_interval(secs => p_lease_seconds)
-    where r.id = p_run_id;
 
+    -- Validate the replay position before returning saved output or starting work.
     select * into v_step from resume.steps s where s.run_id = p_run_id and s.key = p_key;
     if found and v_step.position <> p_position then
         raise exception 'workflow changed: step % ran at position %, but is now at %',
@@ -42,16 +40,20 @@ begin
         end if;
     end if;
 
-    if v_step.completed_at is not null then
-        return query select v_step.output, null::text;
-        return;
+    -- Saved results remain readable after the deadline. Only new work checks the
+    -- deadline and unresolved step_once outcomes.
+    if v_step.completed_at is null then
+        if v_run.deadline_at <= clock_timestamp() then
+            v_failed := 'the run passed its deadline';
+        elsif v_step.run_id is not null then
+            v_failed := format('step %s started in an earlier attempt and its outcome is unknown', p_key);
+        end if;
     end if;
 
-    if v_run.deadline_at <= clock_timestamp() then
-        v_failed := 'the run passed its deadline';
-    elsif v_step.run_id is not null then
-        v_failed := format('step %s started in an earlier attempt and its outcome is unknown', p_key);
-    end if;
+    -- Replay renews the lease too: advancing through saved steps is progress.
+    update resume.runs r
+    set available_at = clock_timestamp() + make_interval(secs => p_lease_seconds)
+    where r.id = p_run_id;
     if v_failed is not null then
         update resume.runs set failed_at = clock_timestamp(), last_error = v_failed
         where id = p_run_id;
@@ -59,8 +61,10 @@ begin
         return;
     end if;
 
-    insert into resume.steps (run_id, key, position, started_at)
-    values (p_run_id, p_key, p_position, now());
-    return query select null::jsonb, null::text;
+    if v_step.run_id is null then
+        insert into resume.steps (run_id, key, position, started_at)
+        values (p_run_id, p_key, p_position, now());
+    end if;
+    return query select v_step.output, null::text;
 end;
 $$;

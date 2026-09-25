@@ -15,7 +15,7 @@ begin
     end if;
     perform resume.lock_run(p_run_id, p_attempt);
     update resume.runs
-    set released = released + 1,
+    set attempts_used = attempts_used - 1,
         available_at = least(
             clock_timestamp() + make_interval(secs => p_delay_seconds), deadline_at
         ),

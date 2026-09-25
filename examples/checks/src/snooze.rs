@@ -82,7 +82,12 @@ pub(super) async fn snooze_releases_worker_and_locks_preserves_progress_and_cost
         );
 
     let observer = async {
-        wait_for(&client, paused, "released = 1 and not leased").await;
+        wait_for(
+            &client,
+            paused,
+            "attempt = 1 and attempts_used = 0 and not leased",
+        )
+        .await;
         let first_attempt: i64 = client
             .query_one("select attempt from resume.runs where id = $1", &[&paused])
             .await
@@ -92,7 +97,7 @@ pub(super) async fn snooze_releases_worker_and_locks_preserves_progress_and_cost
             run_is(
                 &client,
                 paused,
-                "attempt - released = 0 and last_error is null
+                "attempts_used = 0 and last_error is null
                  and available_at > clock_timestamp() + interval '4 minutes'"
             )
             .await
@@ -142,7 +147,12 @@ pub(super) async fn snooze_releases_worker_and_locks_preserves_progress_and_cost
         assert!(b.is_none());
 
         make_due(&client, paused).await;
-        wait_for(&client, paused, "released = 2 and not leased").await;
+        wait_for(
+            &client,
+            paused,
+            "attempt = 2 and attempts_used = 0 and not leased",
+        )
+        .await;
         assert_eq!(
             starts.load(Ordering::Relaxed),
             1,
@@ -157,7 +167,7 @@ pub(super) async fn snooze_releases_worker_and_locks_preserves_progress_and_cost
                 &client,
                 paused,
                 &format!(
-                    "attempt = {} and attempt - released = 1 and failed_at is null",
+                    "attempt = {} and attempts_used = 1 and failed_at is null",
                     first_attempt + 2
                 )
             )
@@ -235,7 +245,7 @@ pub(super) async fn step_once_cannot_snooze_and_repeat_its_action() {
             run_is(
                 &client,
                 run,
-                "attempt = 1 and released = 0 and last_error like '%cannot snooze%'"
+                "attempt = 1 and attempts_used = 1 and last_error like '%cannot snooze%'"
             )
             .await
         );

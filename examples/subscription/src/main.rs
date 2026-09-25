@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use harness::{Pool, Rng, check_invariants};
 use mock_billing::Billing;
-use resume::{Producer, Result, RetryPolicy, Run, Worker, lock_resource, shutdown_signal};
+use resume::{Job, Producer, Result, RetryPolicy, Worker, lock_resource, shutdown_signal};
 use serde_json::{Value, json};
 use tokio_postgres::{Client, Transaction};
 
@@ -17,7 +17,7 @@ const INVARIANTS: &str = include_str!("../invariants.sql");
 
 /// Applies the latest requested plan. `PLAIN=1` omits `is_latest`, allowing stale requests
 /// to overwrite newer plans.
-async fn change_plan(run: &Run, billing: &mut Billing, plain: bool) -> Result<()> {
+async fn change_plan(run: &Job, billing: &mut Billing, plain: bool) -> Result<()> {
     let customer_id = run.input["customer_id"]
         .as_i64()
         .ok_or("customer_id must be an integer")?;

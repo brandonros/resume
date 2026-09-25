@@ -3,14 +3,14 @@
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, FixedOffset, Utc};
-use resume::{Producer, Submitted};
+use resume::{JobHandle, Producer};
 use serde_json::json;
 use tokio_postgres::Client;
 
 use crate::common::{claim, complete, connect, make_due, pass_deadline, run_is, workflow};
 
 /// Submits through `submit`, or through `submit_for` when there is a subject.
-async fn submit_as(producer: &Producer<'_, Client>, subject: Option<&str>, key: &str) -> Submitted {
+async fn submit_as(producer: &Producer<'_, Client>, subject: Option<&str>, key: &str) -> JobHandle {
     match subject {
         None => producer.submit(key, &json!({})).await,
         Some(subject) => producer.submit_for(subject, key, &json!({})).await,

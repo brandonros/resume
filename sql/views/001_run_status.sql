@@ -18,8 +18,7 @@ select
         else 'ready'
     end as status,
     r.attempt,
-    r.released,
-    r.attempt - r.released as attempts_used,
+    r.attempts_used,
     r.max_attempts,
     -- For a leased run this is its recorded lease expiry; otherwise its next eligible time.
     -- Claiming can still be prevented by a row lock, deadline, or exhausted attempt budget.

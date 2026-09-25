@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use mock_vendors::{Faults, Vendors};
 
-use resume::{Permanent, Producer, Result, Run, Worker, lock_resource, shutdown_signal};
+use resume::{Job, Permanent, Producer, Result, Worker, lock_resource, shutdown_signal};
 use serde_json::json;
 
 pub const VERSION: &str = "1";
@@ -16,7 +16,7 @@ const SETUP_FEE_CENTS: i64 = 5000;
 pub const LEASE: Duration = Duration::from_secs(5);
 const STEP_TIMEOUT: Duration = Duration::from_secs(3);
 
-async fn onboard(run: &Run, v: &mut Vendors) -> Result<()> {
+async fn onboard(run: &Job, v: &mut Vendors) -> Result<()> {
     let email = run.input["email"]
         .as_str()
         .ok_or("email must be a string")?;

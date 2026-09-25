@@ -44,7 +44,7 @@ begin
         make_interval(secs => p_retry_delay_seconds),
         make_interval(secs => p_retry_max_delay_seconds),
         v_deadline_at,
-        -- Wake for an earlier deadline so the claim sweep can fail the run on time.
+        -- Wake for an earlier deadline so expiry cleanup can fail the run on time.
         least(coalesce(p_at, v_now + make_interval(secs => p_delay_seconds)), v_deadline_at),
         p_on_failure_workflow, p_on_failure_version
     )

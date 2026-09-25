@@ -9,6 +9,7 @@ members = [
     "examples/shipping",
     "examples/subscription",
     "examples/tickets",
+    "examples/waiting",
 ]
 resolver = "3"
 

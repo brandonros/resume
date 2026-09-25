@@ -1,12 +1,12 @@
 mod mock_issuer;
 
 use mock_issuer::MockIssuer;
-use resume::{Producer, Result, Run, Worker, shutdown_signal};
+use resume::{Job, Producer, Result, Worker, shutdown_signal};
 use serde_json::json;
 
 pub const VERSION: &str = "1";
 
-async fn tickets(run: &Run, issuer: &mut MockIssuer) -> Result<()> {
+async fn tickets(run: &Job, issuer: &mut MockIssuer) -> Result<()> {
     // The run's idempotency key, so duplicate submissions of a request share one run.
     let request_id = &run.idempotency_key;
     let attendee = run.input["attendee"]

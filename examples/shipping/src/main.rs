@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use harness::{Pool, Rng, check_invariants};
 use mock_warehouse::Warehouse;
-use resume::{Producer, Result, Run, Worker, shutdown_signal};
+use resume::{Job, Producer, Result, Worker, shutdown_signal};
 use serde_json::{Value, json};
 use tokio_postgres::{Client, Transaction};
 
@@ -15,7 +15,7 @@ const INVARIANTS: &str = include_str!("../invariants.sql");
 
 /// Checks payment and ships under one lock. `SEPARATE=1` splits them into two steps,
 /// allowing a cancellation between the check and shipment.
-async fn ship_order(run: &Run, warehouse: &mut Warehouse, separate: bool) -> Result<()> {
+async fn ship_order(run: &Job, warehouse: &mut Warehouse, separate: bool) -> Result<()> {
     let order_id = run.input["order_id"]
         .as_i64()
         .ok_or("order_id must be an integer")?;

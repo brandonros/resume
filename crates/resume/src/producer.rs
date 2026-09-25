@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::Value;
 use tokio_postgres::GenericClient;
 
-use crate::Result;
+use crate::{JobHandle, Result};
 
 /// Retry delays double from `delay` up to `max_delay`, then shrink randomly by up to half.
 /// `max_attempts` includes crash recovery but excludes shutdown and snooze releases.
@@ -38,12 +38,6 @@ pub struct Producer<'a, C: GenericClient> {
 enum Start {
     After(Duration),
     At(SystemTime),
-}
-
-pub struct Submitted {
-    pub id: i64,
-    /// False when a run with this idempotency key already existed, in any state.
-    pub created: bool,
 }
 
 impl<'a, C: GenericClient> Producer<'a, C> {
@@ -118,18 +112,18 @@ impl<'a, C: GenericClient> Producer<'a, C> {
     /// Returns the run for `idempotency_key`, creating it if needed. Reusing a key with
     /// different input is an error. The retry policy, schedule and deadline only apply when the
     /// run is created.
-    pub async fn submit(&self, idempotency_key: &str, input: &Value) -> Result<Submitted> {
+    pub async fn submit(&self, idempotency_key: &str, input: &Value) -> Result<JobHandle> {
         self.submit_run(idempotency_key, input, None).await
     }
 
-    /// Like `submit`, for a run that changes `subject`, such as "customer:42". `Run::is_latest`
+    /// Like `submit`, for a run that changes `subject`, such as "customer:42". `Job::is_latest`
     /// then says whether a newer run of this workflow has the same subject.
     pub async fn submit_for(
         &self,
         subject: &str,
         idempotency_key: &str,
         input: &Value,
-    ) -> Result<Submitted> {
+    ) -> Result<JobHandle> {
         self.submit_run(idempotency_key, input, Some(subject)).await
     }
 
@@ -138,7 +132,7 @@ impl<'a, C: GenericClient> Producer<'a, C> {
         idempotency_key: &str,
         input: &Value,
         subject: Option<&str>,
-    ) -> Result<Submitted> {
+    ) -> Result<JobHandle> {
         let (delay, at) = match self.start {
             Start::After(delay) => (delay, None),
             Start::At(at) => (Duration::ZERO, Some(at)),
@@ -166,7 +160,7 @@ impl<'a, C: GenericClient> Producer<'a, C> {
                 ],
             )
             .await?;
-        Ok(Submitted {
+        Ok(JobHandle {
             id: row.try_get("run_id")?,
             created: row.try_get("created")?,
         })
