@@ -7,8 +7,8 @@ use crate::Result;
 
 /// How a run retries after a failed attempt. The first retry waits `delay`, and each later one
 /// waits twice as long as the last, up to `max_delay`, less a random part of up to half.
-/// `max_attempts` counts claims, including recovery after a crash, but not claims a stopping
-/// worker gave back.
+/// `max_attempts` counts claims, including recovery after a crash, but excludes claims
+/// released for shutdown or snoozing.
 #[derive(Clone, Copy, Debug)]
 pub struct RetryPolicy {
     pub max_attempts: i32,

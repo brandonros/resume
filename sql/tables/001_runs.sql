@@ -16,8 +16,8 @@ create table resume.runs (
     deadline_at timestamptz,
     -- Increases with every claim and identifies which claim owns the run.
     attempt bigint not null default 0 check (attempt >= 0),
-    -- Claims that do not count against max_attempts: those a stopping worker gave back, and
-    -- every claim before an operator reopened the run.
+    -- Claims that do not count against max_attempts: those a stopping or snoozing worker gave
+    -- back, and every claim before an operator reopened the run.
     released integer not null default 0 check (released >= 0),
     max_attempts integer not null default 1 check (max_attempts > 0),
     -- The wait after a failed attempt starts at retry_delay and doubles, up to retry_max_delay.

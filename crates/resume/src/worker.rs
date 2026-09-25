@@ -11,7 +11,7 @@ use serde_json::Value;
 use tokio_postgres::{Client, GenericClient, Transaction};
 use tracing::Instrument;
 
-use crate::{Check, Permanent, Result, RunFailed};
+use crate::{Check, Permanent, Result, RunFailed, Snooze};
 
 pub struct Worker {
     client: Client,
@@ -181,7 +181,7 @@ impl Worker {
     }
 
     /// Records how the attempt ended: a retryable error schedules a retry after a backoff,
-    /// a permanent one fails the run, and a stopping worker releases it.
+    /// a permanent one fails the run, and a snoozing or stopping worker releases it.
     async fn settle(&self, run: &Run, result: Result<()>) {
         let error = match result {
             Ok(()) => {
@@ -192,10 +192,20 @@ impl Worker {
         };
 
         if error.is::<Stopping>() {
-            match run.release_run(&self.client).await {
+            match run.release_run(&self.client, Duration::ZERO).await {
                 Ok(()) => tracing::info!("released for another worker"),
                 Err(e) => {
                     tracing::warn!("could not release ({e}); it continues after its lease expires")
+                }
+            }
+            return;
+        }
+
+        if let Some(Snooze(delay)) = error.downcast_ref::<Snooze>() {
+            match run.release_run(&self.client, *delay).await {
+                Ok(()) => tracing::info!("snoozed for {delay:?} (bounded by the run's deadline)"),
+                Err(e) => {
+                    tracing::warn!("could not snooze ({e}); it continues after its lease expires")
                 }
             }
             return;
@@ -416,6 +426,7 @@ impl Run {
     /// The action runs at most once per run. If an attempt dies or times out after starting it
     /// and before saving its result, the outcome is unknown: the run fails instead of calling
     /// again, and someone must check the vendor and call resume.resolve_step.
+    /// Returning `Snooze` also fails the run; use a regular step for readiness checks.
     pub async fn step_once(
         &self,
         client: &mut Client,
@@ -442,7 +453,17 @@ impl Run {
             tx.commit().await?;
 
             tracing::info!("executing once");
-            let output = self.timed(idempotency_key, action()).await?;
+            let output = self.timed(idempotency_key, action()).await.map_err(|error| {
+                if error.is::<Snooze>() {
+                    Permanent(format!(
+                        "step {idempotency_key} cannot snooze after starting a step_once action; \
+                         its outcome is unknown; use a regular step for readiness checks"
+                    ))
+                    .into()
+                } else {
+                    error
+                }
+            })?;
 
             // save_step checks the claim itself, so this needs no transaction of its own.
             let saved = self.save_step(&*client, idempotency_key, &output, None).await?;
@@ -560,10 +581,10 @@ impl Run {
             .try_get(0)?)
     }
 
-    async fn release_run(&self, db: &impl GenericClient) -> Result<()> {
+    async fn release_run(&self, db: &impl GenericClient, delay: Duration) -> Result<()> {
         db.execute(
-            "select resume.release_run($1, $2)",
-            &[&self.id, &self.attempt],
+            "select resume.release_run($1, $2, $3)",
+            &[&self.id, &self.attempt, &delay.as_secs_f64()],
         )
         .await?;
         Ok(())
