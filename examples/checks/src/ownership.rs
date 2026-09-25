@@ -3,10 +3,14 @@
 
 use std::time::Duration;
 
+use resume::Worker;
 use serde_json::{Value, json};
+use tokio::sync::oneshot;
 use tokio_postgres::Client;
 
-use crate::common::{claim, claim_with, complete, connect, end_attempt, submit, workflow};
+use crate::common::{
+    claim, claim_with, complete, connect, end_attempt, run_is, submit, wait_for, workflow,
+};
 
 /// Submits a run to a workflow of its own and claims it with this lease. Returns the run's ID,
 /// the attempt, and the workflow.
@@ -167,4 +171,38 @@ pub(super) async fn passing_the_deadline_fails_the_run_without_starting_the_step
         "a step that never ran needs resolution"
     );
     assert_eq!(row.get::<_, &str>(1), "failed");
+}
+
+pub(super) async fn a_step_key_used_twice_fails_the_run() {
+    let client = connect().await;
+    let name = workflow("duplicate-key");
+    let run = submit(&client, &name).await;
+    let (stop, shutdown) = oneshot::channel::<()>();
+    let worker = Worker::new(connect().await, &name, "1")
+        .poll_interval(Duration::from_millis(10))
+        .run(
+            async {
+                let _ = shutdown.await;
+            },
+            async |run| {
+                for _ in 0..2 {
+                    run.step("same", async |_| Ok(json!(1))).await?;
+                }
+                Ok(())
+            },
+        );
+    let observer = async {
+        wait_for(&client, run, "failed_at is not null").await;
+        assert!(
+            run_is(
+                &client,
+                run,
+                "attempt = 1 and last_error like '%used twice%'"
+            )
+            .await
+        );
+        stop.send(()).unwrap();
+    };
+    let (result, ()) = tokio::join!(worker, observer);
+    result.unwrap();
 }

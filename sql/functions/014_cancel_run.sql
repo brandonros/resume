@@ -7,7 +7,8 @@ language plpgsql
 as $$
 begin
     update resume.runs
-    set failed_at = clock_timestamp(), last_error = 'cancelled by an operator'
+    set failed_at = clock_timestamp(), cancelled_at = clock_timestamp(),
+        last_error = 'cancelled by an operator'
     where id = p_run_id and completed_at is null and failed_at is null;
     if not found then
         raise exception 'run % has already finished', p_run_id using errcode = '55000';

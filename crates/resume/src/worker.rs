@@ -1,6 +1,7 @@
 //! The consumer side: a Worker claims runs and executes them, and a Run is the handle workflow
 //! code uses to execute its steps.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::pin::pin;
 use std::sync::Arc;
@@ -103,7 +104,16 @@ impl Worker {
         );
         let mut waiting = false;
         while !stopping.load(Ordering::Relaxed) {
-            let Some((run, expired)) = self.claim_run(&stopping).await? else {
+            let claimed = match self.claim_run(&stopping).await {
+                Ok(claimed) => claimed,
+                Err(error) if self.client.lock().await.is_closed() => return Err(error),
+                // A transient error, such as a statement timeout: try again after the interval.
+                Err(error) => {
+                    tracing::warn!("{workflow}: could not claim ({error}); trying again");
+                    None
+                }
+            };
+            let Some((run, expired)) = claimed else {
                 if !waiting {
                     tracing::info!("{workflow}: waiting for work");
                     waiting = true;
@@ -181,6 +191,7 @@ impl Worker {
                 step_timeout: self.step_timeout,
                 stopping: stopping.clone(),
                 position: AtomicI32::new(0),
+                keys: std::sync::Mutex::default(),
                 client: self.client.clone(),
             };
             Ok((run, row.try_get("expired")?))
@@ -230,6 +241,8 @@ pub struct Run {
     stopping: Arc<AtomicBool>,
     /// The position the next step will have in this attempt.
     position: AtomicI32,
+    /// The keys of the steps this attempt has started.
+    keys: std::sync::Mutex<HashSet<String>>,
     client: Arc<Mutex<Client>>,
 }
 
@@ -325,12 +338,17 @@ impl Run {
         self.attempt - i64::from(self.released)
     }
 
-    /// The connection for a step. Only one step runs at a time, so it is free unless a step's
-    /// action started another step.
+    /// The connection for a step. It is free unless another step of this run is in progress,
+    /// started inside a step's action or alongside it, as with `join!`.
     fn client(&self) -> Result<MutexGuard<'_, Client>> {
-        self.client
-            .try_lock()
-            .map_err(|_| Permanent("a step cannot start another step".into()).into())
+        self.client.try_lock().map_err(|_| {
+            Permanent(
+                "steps run one at a time: await each step before starting the next, \
+                 and do not start one inside another's action"
+                    .into(),
+            )
+            .into()
+        })
     }
 
     /// Starts a transaction holding the run's lock, after checking this attempt owns it, and
@@ -345,6 +363,12 @@ impl Run {
         // A stopping worker lets the step in progress finish and starts no more.
         if self.stopping.load(Ordering::Relaxed) {
             return Err(Stopping.into());
+        }
+        if !self.keys.lock().unwrap().insert(key.to_string()) {
+            return Err(Permanent(format!(
+                "step key {key} is used twice; keys must be unique within a run"
+            ))
+            .into());
         }
         let position = self.position.fetch_add(1, Ordering::Relaxed);
         let tx = client.transaction().await?;

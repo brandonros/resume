@@ -31,11 +31,14 @@ create table resume.runs (
     leased boolean not null default false,
     completed_at timestamptz,
     failed_at timestamptz,
+    -- Set with failed_at when an operator cancelled the run.
+    cancelled_at timestamptz,
     last_error text,
     on_failure_workflow text check (on_failure_workflow <> ''),
     on_failure_version text check (on_failure_version <> ''),
     check ((on_failure_workflow is null) = (on_failure_version is null)),
     check (completed_at is null or failed_at is null),
+    check (cancelled_at is null or failed_at is not null),
     unique (workflow, idempotency_key)
 );
 

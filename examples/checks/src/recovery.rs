@@ -129,6 +129,20 @@ pub(super) async fn every_terminal_path_queues_the_handler() {
         }
         assert!(claim(&client, &workflow).await.is_none());
         assert_eq!(handlers(&client, run).await, 1, "{path} lost the handler");
+        let status: String = client
+            .query_one(
+                "select status from resume.run_status where id = $1",
+                &[&run],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let expected = if path == "cancel" {
+            "cancelled"
+        } else {
+            "failed"
+        };
+        assert_eq!(status, expected, "{path}");
     }
 }
 
@@ -213,7 +227,10 @@ pub(super) async fn worker_exhaustion_queues_handler_without_step_output() {
     let client = connect().await;
     let vendor = connect().await;
     vendor
-        .batch_execute("create table resume.check_vendor_effects (run_id bigint primary key)")
+        .batch_execute(
+            "create schema if not exists checks;
+             create table if not exists checks.vendor_effects (run_id bigint primary key)",
+        )
         .await
         .unwrap();
     let (id, workflow) = submit(&client, "worker", 1).await;
@@ -227,10 +244,7 @@ pub(super) async fn worker_exhaustion_queues_handler_without_step_output() {
             async |run| {
                 run.step("charge", async |_| {
                     vendor
-                        .execute(
-                            "insert into resume.check_vendor_effects values ($1)",
-                            &[&run.id],
-                        )
+                        .execute("insert into checks.vendor_effects values ($1)", &[&run.id])
                         .await?;
                     Err("vendor committed, but its response was lost".into())
                 })
@@ -252,7 +266,7 @@ pub(super) async fn worker_exhaustion_queues_handler_without_step_output() {
                 &client,
                 id,
                 "not exists (select 1 from resume.steps s where s.run_id = runs.id)
-                 and (select count(*) from resume.check_vendor_effects v where v.run_id = runs.id) = 1"
+                 and (select count(*) from checks.vendor_effects v where v.run_id = runs.id) = 1"
             )
             .await
         );

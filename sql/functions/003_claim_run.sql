@@ -29,7 +29,8 @@ begin
     -- Fail waiting runs past their deadline, and runs whose final attempt's lease expired. An
     -- attempt that returns an error goes through end_attempt instead. No attempt
     -- holds these claims, so this cannot go through end_attempt. Skip locked runs so a busy
-    -- worker cannot hold up claims.
+    -- worker cannot hold up claims, and take a bounded batch so a backlog, and the handler
+    -- runs it queues, cannot make one claim slow; later claims take the rest.
     with ended as (
         select r.id, r.deadline_at <= v_now as past_deadline
         from resume.runs r
@@ -38,6 +39,7 @@ begin
           and r.failed_at is null
           and r.available_at <= v_now
           and (r.attempt - r.released >= r.max_attempts or r.deadline_at <= v_now)
+        limit 100
         for update skip locked
     )
     update resume.runs r

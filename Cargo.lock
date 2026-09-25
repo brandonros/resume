@@ -121,18 +121,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
-name = "counter"
-version = "0.1.0"
-dependencies = [
- "harness",
- "resume",
- "serde_json",
- "tokio",
- "tokio-postgres",
- "tracing",
-]
-
-[[package]]
 name = "cpufeatures"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -179,18 +167,6 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys",
-]
-
-[[package]]
-name = "exports"
-version = "0.1.0"
-dependencies = [
- "harness",
- "resume",
- "serde_json",
- "tokio",
- "tokio-postgres",
- "tracing",
 ]
 
 [[package]]
@@ -551,19 +527,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags",
-]
-
-[[package]]
-name = "reminders"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "harness",
- "resume",
- "serde_json",
- "tokio",
- "tokio-postgres",
- "tracing",
 ]
 
 [[package]]

@@ -7,7 +7,7 @@ just check
 ```
 
 This creates a temporary PostgreSQL database, installs the framework schema, runs all
-23 scenarios, and drops the database on exit. An assertion failure or timeout makes
+25 scenarios, and drops the database on exit. An assertion failure or timeout makes
 the command fail. It does not touch your application database.
 
 The scenarios cover:
@@ -18,6 +18,6 @@ The scenarios cover:
 - Failure handlers: atomic dispatch, terminal failure paths, saved cleanup progress, and lost results.
 
 The runner calls ordinary async Rust functions; there is no separate test harness.
-To use your own **fresh, disposable database** with the core schema installed, run
-`DATABASE_URL=... cargo run -p checks`. These checks write data and expect an empty
-database each time.
+To use your own **disposable database** with the core schema installed, run
+`DATABASE_URL=... cargo run -p checks`. Each scenario uses workflows of its own, and scratch
+tables go in a `checks` schema, so the checks can run again on the same database.

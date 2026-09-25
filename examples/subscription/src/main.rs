@@ -2,7 +2,7 @@ mod mock_billing;
 
 use std::time::{Duration, Instant};
 
-use harness::{Pool, Rng, check_invariants, log_files};
+use harness::{Pool, Rng, check_invariants};
 use mock_billing::Billing;
 use resume::{Producer, Result, RetryPolicy, Run, Worker, lock_resource, shutdown_signal};
 use serde_json::{Value, json};
@@ -28,7 +28,6 @@ async fn change_plan(run: &Run, billing: &mut Billing, plain: bool) -> Result<()
     let applied = run
         .step("set_plan", async |tx| {
             if !plain && !run.is_latest(tx).await? {
-                tracing::info!("skipped: superseded by a newer request");
                 return Ok(json!({"skipped": "superseded by a newer request"}));
             }
             set_plan(billing, tx, customer_id, plan).await
@@ -123,12 +122,15 @@ async fn race(
     .await?;
     pool.stop().await;
 
-    let mut superseded = 0;
-    for log in log_files(&pool.logs)? {
-        superseded += std::fs::read_to_string(log)?
-            .matches("skipped: superseded by a newer request")
-            .count();
-    }
+    // Count from the saved steps, which record each skip exactly once.
+    let superseded: i64 = client
+        .query_one(
+            "select count(*) from resume.steps s join resume.runs r on r.id = s.run_id
+             where r.workflow = 'subscription' and s.output ? 'skipped'",
+            &[],
+        )
+        .await?
+        .try_get(0)?;
     println!(
         "{mode}: {customers} customers x {changes} changes, {workers} workers, {:.1}s; \
          {superseded} steps skipped as superseded",

@@ -138,7 +138,7 @@ async fn work(url: &str) -> Result<()> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let (url, client) = harness::start().await?;
+    let url = harness::init()?;
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("submit") => {
@@ -149,6 +149,7 @@ async fn main() -> Result<()> {
             if !matches!(mode.as_str(), "fail" | "crash-refund") {
                 return Err("mode must be fail or crash-refund".into());
             }
+            let client = harness::connect(&url).await?;
             let submitted = Producer::new(&client, "checkout", VERSION)
                 .on_failure("checkout_failure", VERSION)
                 .submit(

@@ -26,13 +26,14 @@ pub(super) async fn snooze_releases_worker_and_locks_preserves_progress_and_cost
         .id;
     client
         .batch_execute(
-            "create table resume.test_snooze_effects (run_id bigint primary key, writes integer not null)",
+            "create schema if not exists checks;
+             create table if not exists checks.snooze_effects (run_id bigint primary key, writes integer not null)",
         )
         .await
         .unwrap();
     client
         .execute(
-            "insert into resume.test_snooze_effects values ($1, 0)",
+            "insert into checks.snooze_effects values ($1, 0)",
             &[&paused],
         )
         .await
@@ -56,7 +57,7 @@ pub(super) async fn snooze_releases_worker_and_locks_preserves_progress_and_cost
                     .step("start_export", async |tx| {
                         starts.fetch_add(1, Ordering::Relaxed);
                         tx.execute(
-                            "update resume.test_snooze_effects set writes = writes + 1 where run_id = $1",
+                            "update checks.snooze_effects set writes = writes + 1 where run_id = $1",
                             &[&run.id],
                         )
                         .await?;
@@ -67,7 +68,7 @@ pub(super) async fn snooze_releases_worker_and_locks_preserves_progress_and_cost
                 run.step("check_export", async |tx| {
                     checks.fetch_add(1, Ordering::Relaxed);
                     tx.execute(
-                        "update resume.test_snooze_effects set writes = writes + 100 where run_id = $1",
+                        "update checks.snooze_effects set writes = writes + 100 where run_id = $1",
                         &[&run.id],
                     )
                     .await?;
@@ -115,7 +116,7 @@ pub(super) async fn snooze_releases_worker_and_locks_preserves_progress_and_cost
         .unwrap();
         assert_eq!(
             tx.query_one(
-                "select writes from resume.test_snooze_effects where run_id = $1 for update nowait",
+                "select writes from checks.snooze_effects where run_id = $1 for update nowait",
                 &[&paused],
             )
             .await
@@ -168,7 +169,7 @@ pub(super) async fn snooze_releases_worker_and_locks_preserves_progress_and_cost
         assert_eq!(
             client
                 .query_one(
-                    "select writes from resume.test_snooze_effects where run_id = $1",
+                    "select writes from checks.snooze_effects where run_id = $1",
                     &[&paused],
                 )
                 .await

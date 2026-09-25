@@ -1,6 +1,5 @@
 -- Current committed state for operators. A lease describes a claim, not proof that a worker
 -- is running. A step's uncommitted progress and lease renewal are not visible here.
--- Cancellation is identified by cancel_run's error text; there is no separate stored outcome.
 -- newer_run_id means another request exists, not that this run skipped any step. Superseded
 -- steps and attempt history are not stored, so this view cannot report them as outcomes.
 create or replace view resume.run_status as
@@ -12,7 +11,7 @@ select
     r.subject,
     case
         when r.completed_at is not null then 'completed'
-        when r.failed_at is not null and r.last_error = 'cancelled by an operator' then 'cancelled'
+        when r.cancelled_at is not null then 'cancelled'
         when r.failed_at is not null then 'failed'
         when r.leased and r.available_at <= statement_timestamp() then 'lease_expired'
         when r.leased then 'leased'

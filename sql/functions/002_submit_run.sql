@@ -1,20 +1,21 @@
 -- Returns the run for this key, creating it if needed. A key maps to one run for good,
 -- even after that run fails, so a step_once action cannot repeat through a new run. Keys
 -- starting with 'resume:' are reserved for runs resume creates, such as failure handlers.
+-- Parameters after p_input have defaults, so SQL callers can name only what they set.
 create or replace function resume.submit_run(
     p_workflow text,
     p_version text,
     p_idempotency_key text,
     p_input jsonb,
-    p_max_attempts integer,
-    p_retry_delay_seconds double precision,
-    p_retry_max_delay_seconds double precision,
-    p_subject text,
-    p_deadline_seconds double precision,
-    p_delay_seconds double precision,
-    p_at timestamptz,
-    p_on_failure_workflow text,
-    p_on_failure_version text
+    p_max_attempts integer default 3,
+    p_retry_delay_seconds double precision default 1,
+    p_retry_max_delay_seconds double precision default 60,
+    p_subject text default null,
+    p_deadline_seconds double precision default null,
+    p_delay_seconds double precision default 0,
+    p_at timestamptz default null,
+    p_on_failure_workflow text default null,
+    p_on_failure_version text default null
 )
 returns table (run_id bigint, created boolean)
 language plpgsql

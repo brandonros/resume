@@ -14,14 +14,19 @@ use tokio_postgres::{Client, NoTls};
 
 pub use rng::Rng;
 
-/// Starts logging to stderr and connects to DATABASE_URL. Returns the URL too, for workers
-/// and vendors that need connections of their own.
-pub async fn start() -> Result<(String, Client)> {
+/// Starts logging to stderr and returns DATABASE_URL.
+pub fn init() -> Result<String> {
     tracing_subscriber::fmt()
         .with_target(false)
         .with_writer(std::io::stderr)
         .init();
-    let url = std::env::var("DATABASE_URL").map_err(|_| "set DATABASE_URL")?;
+    Ok(std::env::var("DATABASE_URL").map_err(|_| "set DATABASE_URL")?)
+}
+
+/// Like `init`, and connects to DATABASE_URL. Returns the URL too, for workers and vendors
+/// that need connections of their own.
+pub async fn start() -> Result<(String, Client)> {
+    let url = init()?;
     let client = connect(&url).await?;
     Ok((url, client))
 }

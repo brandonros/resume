@@ -23,12 +23,14 @@ async fn main() {
     check!(ownership::expired_lease_cannot_start_a_step);
     check!(ownership::completed_step_replays_its_output);
     check!(ownership::passing_the_deadline_fails_the_run_without_starting_the_step);
+    check!(ownership::a_step_key_used_twice_fails_the_run);
     check!(scheduling::delayed_runs_are_stored_but_only_claimed_when_due);
     check!(scheduling::earlier_deadline_fails_a_scheduled_run_without_claiming_it);
     check!(scheduling::submission_rejects_invalid_schedules_and_zero_is_immediately_eligible);
     check!(scheduling::absolute_times_preserve_offsets_and_duplicate_submissions_keep_the_schedule);
     check!(scheduling::past_times_are_eligible_and_the_last_schedule_setter_wins);
     check!(scheduling::an_absolute_schedule_cannot_postpone_the_deadline);
+    check!(scheduling::reopening_a_run_that_passed_its_deadline_clears_the_deadline);
     check!(snooze::snooze_releases_worker_and_locks_preserves_progress_and_costs_no_retry);
     check!(snooze::snooze_cannot_delay_the_deadline);
     check!(snooze::step_once_cannot_snooze_and_repeat_its_action);
@@ -39,5 +41,5 @@ async fn main() {
     check!(recovery::failed_handler_reopens_with_saved_progress);
     check!(recovery::reserved_handler_keys_cannot_be_submitted);
     check!(recovery::worker_exhaustion_queues_handler_without_step_output);
-    println!("All 23 checks passed.");
+    println!("All 25 checks passed.");
 }

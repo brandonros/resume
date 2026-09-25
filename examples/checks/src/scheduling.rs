@@ -124,7 +124,7 @@ pub(super) async fn submission_rejects_invalid_schedules_and_zero_is_immediately
     ] {
         let error = client
             .query_one(
-                "select * from resume.submit_run($1, '1', 'key', '{}', 1, 1, 60, null, null, $2, null, null, null)",
+                "select * from resume.submit_run($1, '1', 'key', '{}', p_max_attempts => 1, p_delay_seconds => $2)",
                 &[&name, &delay],
             )
             .await
@@ -138,8 +138,8 @@ pub(super) async fn submission_rejects_invalid_schedules_and_zero_is_immediately
     ] {
         let error = client
             .query_one(
-                "select * from resume.submit_run($1, '1', 'key', '{}', 1, 1, 60, null, null,
-                                            $2, $3::text::timestamptz, null, null)",
+                "select * from resume.submit_run($1, '1', 'key', '{}', p_max_attempts => 1,
+                     p_delay_seconds => $2, p_at => $3::text::timestamptz)",
                 &[&name, &delay, &at],
             )
             .await
@@ -158,7 +158,7 @@ pub(super) async fn submission_rejects_invalid_schedules_and_zero_is_immediately
 
     let run: i64 = client
         .query_one(
-            "select run_id from resume.submit_run($1, '1', 'key', '{}', 1, 1, 60, null, null, 0, null, null, null)",
+            "select run_id from resume.submit_run($1, '1', 'key', '{}', p_max_attempts => 1)",
             &[&name],
         )
         .await
@@ -256,4 +256,23 @@ pub(super) async fn an_absolute_schedule_cannot_postpone_the_deadline() {
     pass_deadline(&client, run).await;
     assert!(claim(&client, &name).await.is_none());
     assert!(run_is(&client, run, "attempt = 0 and failed_at is not null").await);
+}
+
+pub(super) async fn reopening_a_run_that_passed_its_deadline_clears_the_deadline() {
+    let client = connect().await;
+    let name = workflow("reopen-deadline");
+    let run = Producer::new(&client, &name, "1")
+        .deadline(Duration::from_secs(3600))
+        .submit("key", &json!({}))
+        .await
+        .unwrap()
+        .id;
+    pass_deadline(&client, run).await;
+    assert!(claim(&client, &name).await.is_none());
+    client
+        .execute("select resume.reopen_run($1)", &[&run])
+        .await
+        .unwrap();
+    assert!(run_is(&client, run, "deadline_at is null and failed_at is null").await);
+    assert_eq!(claim(&client, &name).await.map(|(id, _)| id), Some(run));
 }
