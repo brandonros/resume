@@ -1,14 +1,10 @@
-mod lock;
 mod producer;
-mod run;
 mod worker;
 
 use std::fmt;
 
-pub use lock::lock_resource;
 pub use producer::{Producer, RetryPolicy, Submitted};
-pub use run::Run;
-pub use worker::{Worker, shutdown_signal};
+pub use worker::{Run, Worker, lock_resource, shutdown_signal};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
@@ -32,10 +28,6 @@ pub struct Permanent(pub String);
 #[derive(Debug)]
 pub struct RunFailed(pub String);
 
-/// The worker is stopping, so the run stops before its next step and is released.
-#[derive(Debug)]
-pub(crate) struct Stopping;
-
 impl fmt::Display for Permanent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -48,12 +40,5 @@ impl fmt::Display for RunFailed {
     }
 }
 
-impl fmt::Display for Stopping {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("worker is stopping")
-    }
-}
-
 impl std::error::Error for Permanent {}
 impl std::error::Error for RunFailed {}
-impl std::error::Error for Stopping {}
