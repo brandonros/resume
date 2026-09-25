@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use harness::{Pool, Rng, check_history, check_invariants, log_files, pending};
 use mock_billing::Billing;
-use resume::{Producer, Result, RetryPolicy, Run, Worker, lock_resource, shutdown_signal};
-use serde_json::json;
+use resume::{Check, Producer, Result, RetryPolicy, Run, Worker, lock_resource, shutdown_signal};
+use serde_json::{Value, json};
 use tokio_postgres::{Client, NoTls, Transaction};
 
 /// The version of this workflow's input and steps; producers and workers must agree.
@@ -16,9 +16,9 @@ const LEASE: Duration = Duration::from_secs(5);
 const STEP_TIMEOUT: Duration = Duration::from_secs(3);
 const INVARIANTS: &str = include_str!("../invariants.sql");
 
-/// Sets a customer's plan at billing and in our record. With `step_latest`, a run whose
-/// request a newer one replaced does nothing. `PLAIN=1` uses `step` instead, to show the stale
-/// plans that `step_latest` prevents.
+/// Sets a customer's plan at billing and in our record, skipping it if a newer request for the
+/// customer replaced this one. `PLAIN=1` uses a plain `step` instead, to show the stale plans
+/// the check prevents.
 async fn change_plan(
     client: &mut Client,
     run: &Run,
@@ -30,23 +30,28 @@ async fn change_plan(
         .ok_or("customer_id must be an integer")?;
     let plan = run.input["plan"].as_str().ok_or("plan must be a string")?;
 
-    // Both modes lock the customer, so runs for one customer take turns. The lock alone does
-    // not stop an older request from taking its turn last; step_latest's check does.
-    let set_plan = async |tx: &Transaction<'_>| {
-        lock_resource(tx, &format!("customer:{customer_id}")).await?;
-        billing.set_plan(customer_id, plan).await?;
-        tx.execute(
-            "insert into subscription.customers (id, plan) values ($1, $2)
-             on conflict (id) do update set plan = excluded.plan",
-            &[&customer_id, &plan],
-        )
-        .await?;
-        Ok(json!(plan))
-    };
     let applied = if plain {
-        Some(run.step(client, "set_plan", set_plan).await?)
+        Some(
+            run.step(client, "set_plan", async |tx| {
+                set_plan(billing, tx, customer_id, plan).await
+            })
+            .await?,
+        )
     } else {
-        run.step_latest(client, "set_plan", set_plan).await?
+        run.step_if(
+            client,
+            "set_plan",
+            billing,
+            async |_, tx| {
+                Ok(if run.is_latest(tx).await? {
+                    Check::Proceed
+                } else {
+                    Check::Skip("superseded by a newer request".into())
+                })
+            },
+            async |billing, tx| set_plan(billing, tx, customer_id, plan).await,
+        )
+        .await?
     };
 
     match applied {
@@ -54,6 +59,25 @@ async fn change_plan(
         None => tracing::info!("a newer request for customer {customer_id} replaced {plan}"),
     }
     Ok(())
+}
+
+/// Both modes lock the customer, so runs for one customer take turns. The lock alone does not
+/// stop an older request from taking its turn last; the is_latest check does.
+async fn set_plan(
+    billing: &mut Billing,
+    tx: &Transaction<'_>,
+    customer_id: i64,
+    plan: &str,
+) -> Result<Value> {
+    lock_resource(tx, &format!("customer:{customer_id}")).await?;
+    billing.set_plan(customer_id, plan).await?;
+    tx.execute(
+        "insert into subscription.customers (id, plan) values ($1, $2)
+         on conflict (id) do update set plan = excluded.plan",
+        &[&customer_id, &plan],
+    )
+    .await?;
+    Ok(json!(plan))
 }
 
 /// Plays the customers: each asks for a new plan `changes` times, one request after another,
@@ -75,7 +99,7 @@ async fn race(
         )
         .await?;
 
-    let mode = if plain { "step" } else { "step_latest" };
+    let mode = if plain { "step" } else { "step_if" };
     let mut pool = Pool::new(&format!("subscription-{mode}"))?;
     for n in 0..workers {
         pool.spawn(&[
@@ -115,7 +139,7 @@ async fn race(
     let mut superseded = 0;
     for log in log_files(&pool.logs)? {
         superseded += std::fs::read_to_string(log)?
-            .matches("superseded by a newer run")
+            .matches("skipped: superseded by a newer request")
             .count();
     }
     println!(
@@ -193,8 +217,7 @@ async fn main() -> Result<()> {
             }
         }
         _ => Err(
-            "expected work, race [customers] [changes] [workers] [step|step_latest], or check"
-                .into(),
+            "expected work, race [customers] [changes] [workers] [step|step_if], or check".into(),
         ),
     }
 }

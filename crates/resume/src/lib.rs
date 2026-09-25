@@ -13,6 +13,16 @@ pub use worker::{Worker, shutdown_signal};
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// What `Run::step_if`'s check decided.
+pub enum Check {
+    /// Run the action.
+    Proceed,
+    /// Skip the action for this reason; the step returns None, now and on every replay.
+    Skip(String),
+    /// Fail the run for this reason, without retrying.
+    Fail(String),
+}
+
 /// Return this from a step for an error another attempt cannot fix, such as invalid input.
 /// The run fails at once instead of using its remaining attempts.
 #[derive(Debug)]

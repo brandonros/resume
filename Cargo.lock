@@ -578,6 +578,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "shipping"
+version = "0.1.0"
+dependencies = [
+ "harness",
+ "resume",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "signal-hook-registry"
 version = "1.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"

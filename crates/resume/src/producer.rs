@@ -73,8 +73,8 @@ impl<'a, C: GenericClient> Producer<'a, C> {
         self.submit_run(idempotency_key, input, None).await
     }
 
-    /// Like `submit`, for a run that changes `subject`, such as "customer:42". Its
-    /// `step_latest` steps run only if no newer run of this workflow has the same subject.
+    /// Like `submit`, for a run that changes `subject`, such as "customer:42". `Run::is_latest`
+    /// then says whether a newer run of this workflow has the same subject.
     pub async fn submit_for(
         &self,
         subject: &str,

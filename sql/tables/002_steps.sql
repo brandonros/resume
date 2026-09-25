@@ -13,6 +13,8 @@ create table resume.steps (
     completed_at timestamptz,
     -- A step whose output is JSON null stores 'null'::jsonb, so SQL null means not completed.
     output jsonb,
+    -- Set when step_if's check skipped the step, to the reason it gave; output is then null.
+    skipped text,
     primary key (run_id, idempotency_key),
     unique (run_id, position),
     check ((completed_at is null) = (output is null))

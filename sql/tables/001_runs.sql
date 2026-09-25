@@ -6,8 +6,8 @@ create table resume.runs (
     -- Supplied by the producer. Submitting the same key again returns this run.
     idempotency_key text not null check (idempotency_key <> ''),
     input jsonb not null,
-    -- The record this run changes, such as 'customer:42'. step_latest runs only in the newest
-    -- run of the workflow with the same subject.
+    -- The record this run changes, such as 'customer:42'. Run::is_latest says whether a newer
+    -- run of the workflow has the same subject.
     subject text check (subject <> ''),
     -- The workflow version the producer submitted the run for. Only workers of that version
     -- claim it, so its input and its steps come from the same code.

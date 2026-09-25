@@ -1,6 +1,7 @@
 -- Starts a step: locks the run, checks this attempt still holds its claim, renews the lease,
 -- and records the start. Returns the output if the step already completed, whether an earlier
--- attempt started it without completing it, and whether the run is past its deadline. Raises
+-- attempt started it without completing it, whether the run is past its deadline, and why
+-- step_if skipped it, if it did. Raises
 -- with SQLSTATE RS001 if the step's position differs from when the run first reached it. Call
 -- it first in the step's transaction, so the lock covers the rest of the step.
 create or replace function resume.begin_step(
@@ -10,7 +11,7 @@ create or replace function resume.begin_step(
     p_position integer,
     p_lease_seconds double precision
 )
-returns table (output jsonb, interrupted boolean, past_deadline boolean)
+returns table (output jsonb, interrupted boolean, past_deadline boolean, skipped text)
 language plpgsql
 as $$
 declare
@@ -36,7 +37,8 @@ begin
             raise exception 'workflow changed: step % ran at position %, but is now at %',
                 p_idempotency_key, v_step.position, p_position using errcode = 'RS001';
         end if;
-        return query select v_step.output, v_step.completed_at is null, v_past_deadline;
+        return query select v_step.output, v_step.completed_at is null, v_past_deadline,
+            v_step.skipped;
         return;
     end if;
 
@@ -49,6 +51,6 @@ begin
 
     insert into resume.steps (run_id, idempotency_key, position, started_at)
     values (p_run_id, p_idempotency_key, p_position, now());
-    return query select null::jsonb, false, v_past_deadline;
+    return query select null::jsonb, false, v_past_deadline, null::text;
 end;
 $$;

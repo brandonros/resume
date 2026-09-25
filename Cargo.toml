@@ -5,6 +5,7 @@ members = [
     "examples/harness",
     "examples/onboard",
     "examples/provision",
+    "examples/shipping",
     "examples/subscription",
     "examples/tickets",
 ]

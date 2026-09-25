@@ -6,7 +6,7 @@ use serde_json::Value;
 use tokio_postgres::{Client, GenericClient, Transaction};
 use tracing::Instrument;
 
-use crate::{Permanent, Result, RunFailed, Stopping};
+use crate::{Check, Permanent, Result, RunFailed, Stopping};
 
 pub struct Run {
     pub id: i64,
@@ -33,7 +33,7 @@ impl Run {
         action: impl AsyncFnOnce(&Transaction<'_>) -> Result<Value>,
     ) -> Result<Value> {
         async {
-            let (tx, existing, _) = self.begin_step(client, idempotency_key).await?;
+            let (tx, existing, _, _) = self.begin_step(client, idempotency_key).await?;
             if let Some(output) = existing {
                 tx.commit().await?;
                 tracing::info!("using saved result");
@@ -42,7 +42,7 @@ impl Run {
 
             tracing::info!("executing");
             let output = self.timed(idempotency_key, action(&tx)).await?;
-            let saved = self.save_step(&tx, idempotency_key, &output).await?;
+            let saved = self.save_step(&tx, idempotency_key, &output, None).await?;
             tx.commit().await?;
             tracing::info!("committed");
             Ok(saved)
@@ -65,7 +65,7 @@ impl Run {
         action: impl AsyncFnOnce(&mut C, &Transaction<'_>) -> Result<Value>,
     ) -> Result<Value> {
         async {
-            let (tx, existing, _) = self.begin_step(client, idempotency_key).await?;
+            let (tx, existing, _, _) = self.begin_step(client, idempotency_key).await?;
             if let Some(output) = existing {
                 tx.commit().await?;
                 tracing::info!("using saved result");
@@ -86,7 +86,7 @@ impl Run {
                     }
                 })
                 .await?;
-            let saved = self.save_step(&tx, idempotency_key, &output).await?;
+            let saved = self.save_step(&tx, idempotency_key, &output, None).await?;
             tx.commit().await?;
             tracing::info!("committed");
             Ok(saved)
@@ -95,45 +95,75 @@ impl Run {
         .await
     }
 
-    /// For a change that a newer request replaces, such as setting a customer's plan. The
-    /// action runs only if no newer run of this workflow has the same subject (see
-    /// `Producer::submit_for`); otherwise the step returns None and saves nothing, because a
-    /// newer run makes the change. The subject stays locked until the step commits, so a newer
-    /// run's step waits and applies after this one.
-    pub async fn step_latest(
+    /// For a change the current state must still allow, such as shipping an order only while it
+    /// is paid. `check` decides, in the same transaction as `action`, so nothing can change in
+    /// between as long as `check` locks what it reads: `select ... for update` for rows,
+    /// `lock_resource` for anything else. `Check::Skip` saves the reason and returns None, now and
+    /// on every replay; `Check::Fail` fails the run. Both closures receive `context`, as in
+    /// `ensure`.
+    pub async fn step_if<C>(
         &self,
         client: &mut Client,
         idempotency_key: &str,
-        action: impl AsyncFnOnce(&Transaction<'_>) -> Result<Value>,
+        context: &mut C,
+        check: impl AsyncFnOnce(&mut C, &Transaction<'_>) -> Result<Check>,
+        action: impl AsyncFnOnce(&mut C, &Transaction<'_>) -> Result<Value>,
     ) -> Result<Option<Value>> {
         async {
-            let (tx, existing, _) = self.begin_step(client, idempotency_key).await?;
+            let (tx, existing, _, skipped) = self.begin_step(client, idempotency_key).await?;
             if let Some(output) = existing {
                 tx.commit().await?;
-                tracing::info!("using saved result");
-                return Ok(Some(output));
+                return Ok(match skipped {
+                    Some(reason) => {
+                        tracing::info!("skipped earlier: {reason}");
+                        None
+                    }
+                    None => {
+                        tracing::info!("using saved result");
+                        Some(output)
+                    }
+                });
             }
 
-            let latest: bool = tx
-                .query_one("select resume.lock_subject($1)", &[&self.id])
-                .await?
-                .try_get(0)?;
-            if !latest {
-                // Nothing to keep: a replay checks again and finds the same newer run.
-                tx.rollback().await?;
-                tracing::info!("superseded by a newer run");
-                return Ok(None);
-            }
-
-            tracing::info!("executing");
-            let output = self.timed(idempotency_key, action(&tx)).await?;
-            let saved = self.save_step(&tx, idempotency_key, &output).await?;
+            let outcome = self
+                .timed(idempotency_key, async {
+                    match check(&mut *context, &tx).await? {
+                        Check::Proceed => {
+                            tracing::info!("executing");
+                            Ok(Ok(action(&mut *context, &tx).await?))
+                        }
+                        Check::Skip(reason) => Ok(Err(reason)),
+                        Check::Fail(reason) => Err(Permanent(reason).into()),
+                    }
+                })
+                .await?;
+            let saved = match outcome {
+                Ok(output) => Some(self.save_step(&tx, idempotency_key, &output, None).await?),
+                Err(reason) => {
+                    self.save_step(&tx, idempotency_key, &Value::Null, Some(&reason))
+                        .await?;
+                    tracing::info!("skipped: {reason}");
+                    None
+                }
+            };
             tx.commit().await?;
-            tracing::info!("committed");
-            Ok(Some(saved))
+            if saved.is_some() {
+                tracing::info!("committed");
+            }
+            Ok(saved)
         }
         .instrument(step_span(idempotency_key))
         .await
+    }
+
+    /// Whether no newer run of this workflow has the same subject (see `Producer::submit_for`),
+    /// for use in `step_if`'s check. Locks the subject until the step's transaction ends, so a
+    /// newer run's step waits for this one to commit and applies after it.
+    pub async fn is_latest(&self, tx: &Transaction<'_>) -> Result<bool> {
+        Ok(tx
+            .query_one("select resume.lock_subject($1)", &[&self.id])
+            .await?
+            .try_get(0)?)
     }
 
     /// For external effects that must not repeat, such as a vendor without idempotency.
@@ -147,7 +177,7 @@ impl Run {
         action: impl AsyncFnOnce() -> Result<Value>,
     ) -> Result<Value> {
         async {
-            let (tx, existing, interrupted) = self.begin_step(client, idempotency_key).await?;
+            let (tx, existing, interrupted, _) = self.begin_step(client, idempotency_key).await?;
             if let Some(output) = existing {
                 tx.commit().await?;
                 tracing::info!("using saved result");
@@ -169,7 +199,7 @@ impl Run {
             let output = self.timed(idempotency_key, action()).await?;
 
             // save_step checks the claim itself, so this needs no transaction of its own.
-            let saved = self.save_step(&*client, idempotency_key, &output).await?;
+            let saved = self.save_step(&*client, idempotency_key, &output, None).await?;
             tracing::info!("committed");
             Ok(saved)
         }
@@ -184,13 +214,14 @@ impl Run {
 
     /// Starts a transaction holding the run's lock, after checking this attempt owns it, and
     /// records the step's start. Returns the step's saved output if it already completed, and
-    /// whether an earlier attempt started it without completing it. Fails the run if it is past
-    /// its deadline, or if the step's position changed since the run first reached it.
+    /// whether an earlier attempt started it without completing it, and why step_if skipped it,
+    /// if it did. Fails the run if it is past its deadline, or if the step's position changed
+    /// since the run first reached it.
     async fn begin_step<'c>(
         &self,
         client: &'c mut Client,
         key: &str,
-    ) -> Result<(Transaction<'c>, Option<Value>, bool)> {
+    ) -> Result<(Transaction<'c>, Option<Value>, bool, Option<String>)> {
         // A stopping worker lets the step in progress finish and starts no more.
         if self.stopping.load(Ordering::Relaxed) {
             return Err(Stopping.into());
@@ -199,7 +230,7 @@ impl Run {
         let tx = client.transaction().await?;
         let row = tx
             .query_one(
-                "select output, interrupted, past_deadline
+                "select output, interrupted, past_deadline, skipped
                  from resume.begin_step($1, $2, $3, $4, $5)",
                 &[
                     &self.id,
@@ -220,7 +251,12 @@ impl Run {
             tx.commit().await?;
             return Err(error.into());
         }
-        Ok((tx, row.try_get("output")?, row.try_get("interrupted")?))
+        Ok((
+            tx,
+            row.try_get("output")?,
+            row.try_get("interrupted")?,
+            row.try_get("skipped")?,
+        ))
     }
 
     /// Fails the step if its action takes longer than the step timeout. Timing out stops the
@@ -233,11 +269,17 @@ impl Run {
         }
     }
 
-    async fn save_step(&self, db: &impl GenericClient, key: &str, output: &Value) -> Result<Value> {
+    async fn save_step(
+        &self,
+        db: &impl GenericClient,
+        key: &str,
+        output: &Value,
+        skipped: Option<&str>,
+    ) -> Result<Value> {
         Ok(db
             .query_one(
-                "select resume.save_step($1, $2, $3, $4)",
-                &[&self.id, &self.attempt, &key, output],
+                "select resume.save_step($1, $2, $3, $4, $5)",
+                &[&self.id, &self.attempt, &key, output, &skipped],
             )
             .await?
             .try_get(0)?)

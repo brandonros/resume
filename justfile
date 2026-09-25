@@ -3,7 +3,7 @@ export DATABASE_URL := server + "/resume"
 export PATH := "/Users/brandon/Applications/Postgres.app/Contents/Versions/18/bin:" + env("PATH")
 
 # Drops and recreates the resume database with every schema.
-reset: && schema counter-schema onboard-schema provision-schema subscription-schema tickets-schema
+reset: && schema counter-schema onboard-schema provision-schema shipping-schema subscription-schema tickets-schema
     dropdb --if-exists --force --maintenance-db "{{server}}/postgres" resume
     createdb --maintenance-db "{{server}}/postgres" resume
 
@@ -96,12 +96,21 @@ provision-race teams="3" requests="50" workers="20" lock="locked":
 provision-check:
     cargo run -q -p provision -- check
 
+shipping-schema:
+    psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction -f examples/shipping/001_shipping.sql
+
+# Clears the shipping data, then ships orders while customers cancel them, with step_if checking
+# each order is still paid. Pass "separate" to check in an earlier step and watch cancelled
+# orders ship.
+shipping-race orders="200" workers="10" mode="step_if":
+    cargo run -q -p shipping -- race {{orders}} {{workers}} {{mode}}
+
 subscription-schema:
     psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction -f examples/subscription/001_subscription.sql
 
 # Clears the subscription data, then has customers change plans repeatedly while workers apply
-# the changes with step_latest. Pass "step" to use a plain step and watch older plans win.
-subscription-race customers="20" changes="10" workers="10" mode="step_latest":
+# the changes with step_if and is_latest. Pass "step" to use a plain step and watch older plans win.
+subscription-race customers="20" changes="10" workers="10" mode="step_if":
     cargo run -q -p subscription -- race {{customers}} {{changes}} {{workers}} {{mode}}
 
 subscription-check:
