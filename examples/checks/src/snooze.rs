@@ -1,5 +1,5 @@
 //! Durable waiting through the real worker and SQL claim path. Uses the same scratch database
-//! as ownership.rs; run with `just test`.
+//! as ownership.rs; run with `just check`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -11,7 +11,8 @@ use tokio::sync::oneshot;
 use tokio_postgres::{Client, NoTls};
 
 async fn connect() -> Client {
-    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL; run the tests with `just test`");
+    let url =
+        std::env::var("DATABASE_URL").expect("DATABASE_URL; run the checks with `just check`");
     let (client, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(connection);
     client
@@ -49,8 +50,7 @@ async fn make_due(client: &Client, run: i64) {
         .unwrap();
 }
 
-#[tokio::test]
-async fn snooze_releases_worker_and_locks_preserves_progress_and_costs_no_retry() {
+pub(super) async fn snooze_releases_worker_and_locks_preserves_progress_and_costs_no_retry() {
     tokio::task::LocalSet::new().run_until(async {
     let mut client = connect().await;
     let name = workflow("progress");
@@ -232,8 +232,7 @@ async fn snooze_releases_worker_and_locks_preserves_progress_and_costs_no_retry(
     }).await;
 }
 
-#[tokio::test]
-async fn snooze_cannot_delay_the_deadline() {
+pub(super) async fn snooze_cannot_delay_the_deadline() {
     let client = connect().await;
     let name = workflow("deadline");
     let run = Producer::new(&client, &name, "1")
@@ -292,8 +291,7 @@ async fn snooze_cannot_delay_the_deadline() {
     assert_eq!(row.get::<_, String>(1), "the run passed its deadline");
 }
 
-#[tokio::test]
-async fn step_once_cannot_snooze_and_repeat_its_action() {
+pub(super) async fn step_once_cannot_snooze_and_repeat_its_action() {
     let client = connect().await;
     let name = workflow("once");
     let run = Producer::new(&client, &name, "1")
@@ -350,8 +348,7 @@ async fn step_once_cannot_snooze_and_repeat_its_action() {
         .unwrap();
 }
 
-#[tokio::test]
-async fn release_validates_delay_and_zero_releases_immediately() {
+pub(super) async fn release_validates_delay_and_zero_releases_immediately() {
     let client = connect().await;
     let name = workflow("release");
     let run = Producer::new(&client, &name, "1")

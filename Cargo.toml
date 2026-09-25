@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "crates/resume",
+    "examples/checkout",
+    "examples/checks",
     "examples/counter",
     "examples/exports",
     "examples/harness",

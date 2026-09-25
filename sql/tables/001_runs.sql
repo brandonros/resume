@@ -32,6 +32,9 @@ create table resume.runs (
     completed_at timestamptz,
     failed_at timestamptz,
     last_error text,
+    on_failure_workflow text check (on_failure_workflow <> ''),
+    on_failure_version text check (on_failure_version <> ''),
+    check ((on_failure_workflow is null) = (on_failure_version is null)),
     check (completed_at is null or failed_at is null),
     unique (workflow, idempotency_key)
 );

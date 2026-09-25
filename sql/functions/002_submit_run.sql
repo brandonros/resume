@@ -11,7 +11,9 @@ create or replace function resume.submit_run(
     p_subject text,
     p_deadline_seconds double precision,
     p_delay_seconds double precision,
-    p_at timestamptz
+    p_at timestamptz,
+    p_on_failure_workflow text,
+    p_on_failure_version text
 )
 returns table (run_id bigint, created boolean)
 language plpgsql
@@ -30,7 +32,7 @@ begin
     end if;
     insert into resume.runs (
         workflow, version, idempotency_key, input, subject, max_attempts, retry_delay, retry_max_delay,
-        deadline_at, available_at
+        deadline_at, available_at, on_failure_workflow, on_failure_version
     )
     values (
         p_workflow, p_version, p_idempotency_key, p_input, p_subject, p_max_attempts,
@@ -38,7 +40,8 @@ begin
         make_interval(secs => p_retry_max_delay_seconds),
         v_deadline_at,
         -- Wake for an earlier deadline so the claim sweep can fail the run on time.
-        least(coalesce(p_at, v_now + make_interval(secs => p_delay_seconds)), v_deadline_at)
+        least(coalesce(p_at, v_now + make_interval(secs => p_delay_seconds)), v_deadline_at),
+        p_on_failure_workflow, p_on_failure_version
     )
     on conflict (workflow, idempotency_key) do nothing
     returning * into v_run;

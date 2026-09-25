@@ -3,17 +3,24 @@ export DATABASE_URL := server + "/resume"
 export PATH := "/Users/brandon/Applications/Postgres.app/Contents/Versions/18/bin:" + env("PATH")
 
 # Drops and recreates the resume database with every schema.
-reset: && schema counter-schema exports-schema onboard-schema provision-schema reminders-schema shipping-schema subscription-schema tickets-schema
+reset: && schema checkout-schema counter-schema exports-schema onboard-schema provision-schema reminders-schema shipping-schema subscription-schema tickets-schema
     dropdb --if-exists --force --maintenance-db "{{server}}/postgres" resume
     createdb --maintenance-db "{{server}}/postgres" resume
 
-# Runs the tests against a scratch database, recreated each time.
-test:
-    dropdb --if-exists --force --maintenance-db "{{server}}/postgres" resume_test
-    createdb --maintenance-db "{{server}}/postgres" resume_test
-    psql "{{server}}/resume_test" -X -q -v ON_ERROR_STOP=1 --single-transaction \
-        $(printf ' -f %s' sql/tables/*.sql sql/functions/*.sql sql/views/*.sql)
-    DATABASE_URL="{{server}}/resume_test" cargo test --workspace -q
+# Runs every regression scenario in examples/checks against a temporary database.
+check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    check_db="resume_check_$$"
+    createdb --maintenance-db "{{server}}/postgres" "$check_db"
+    trap 'dropdb --if-exists --force --maintenance-db "{{server}}/postgres" "$check_db"' EXIT
+    export DATABASE_URL="{{server}}/$check_db"
+    files=()
+    for file in sql/tables/*.sql sql/functions/*.sql sql/views/*.sql; do
+        files+=(-f "$file")
+    done
+    psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 --single-transaction "${files[@]}"
+    cargo run --quiet -p checks
 
 schema:
     psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction \
@@ -160,3 +167,20 @@ reminders-show:
         -c "select id, idempotency_key, status, attempt, available_at, last_error \
             from resume.run_status where workflow = 'reminders' order by id" \
         -c "select * from reminders.deliveries order by delivered_at"
+
+checkout-schema:
+    psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction -f examples/checkout/001_checkout.sql
+
+checkout-submit key mode="fail":
+    cargo run -p checkout -- submit {{quote(key)}} {{quote(mode)}}
+
+# Runs the checkout and failure-handler workers in one process.
+checkout-process:
+    cargo run -p checkout -- work
+
+checkout-show:
+    psql "$DATABASE_URL" -X \
+        -c "select id, workflow, status, attempt, last_error from resume.run_status \
+            where workflow like 'checkout%' order by id" \
+        -c "select * from checkout.events order by id" \
+        -c "select * from checkout.notifications order by failed_run"

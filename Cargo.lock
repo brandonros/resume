@@ -76,6 +76,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "checkout"
+version = "0.1.0"
+dependencies = [
+ "resume",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "checks"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "resume",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,5 +1,5 @@
 //! Ownership rules of the SQL functions: which attempt may start steps, save them, and record
-//! how it ended. Needs a database with the resume schema in DATABASE_URL; `just test` creates one.
+//! how it ended. Needs a database with the resume schema in DATABASE_URL; `just check` creates one.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -8,7 +8,8 @@ use serde_json::{Value, json};
 use tokio_postgres::{Client, NoTls};
 
 async fn connect() -> Client {
-    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL; run the tests with `just test`");
+    let url =
+        std::env::var("DATABASE_URL").expect("DATABASE_URL; run the checks with `just check`");
     let (client, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(connection);
     client
@@ -22,7 +23,7 @@ async fn claim(client: &Client, lease_seconds: f64) -> (i64, i64, String) {
     let workflow = format!("test-{}-{n}", std::process::id());
     client
         .execute(
-            "select resume.submit_run($1, '1', 'key', '{}', 3, 1, 60, null, null, 0, null)",
+            "select resume.submit_run($1, '1', 'key', '{}', 3, 1, 60, null, null, 0, null, null, null)",
             &[&workflow],
         )
         .await
@@ -52,8 +53,7 @@ async fn sleep(seconds: f64) {
     tokio::time::sleep(Duration::from_secs_f64(seconds)).await;
 }
 
-#[tokio::test]
-async fn new_claim_rejects_previous_attempt() {
+pub(super) async fn new_claim_rejects_previous_attempt() {
     let client = connect().await;
     let (run, first, workflow) = claim(&client, 0.2).await;
     sleep(0.3).await;
@@ -73,8 +73,7 @@ async fn new_claim_rejects_previous_attempt() {
     assert!(old.is_err(), "the replaced attempt completed the run");
 }
 
-#[tokio::test]
-async fn attempt_that_handed_back_the_run_cannot_complete_it() {
+pub(super) async fn attempt_that_handed_back_the_run_cannot_complete_it() {
     let client = connect().await;
     let (run, attempt, _) = claim(&client, 30.0).await;
     client
@@ -88,8 +87,7 @@ async fn attempt_that_handed_back_the_run_cannot_complete_it() {
     assert!(after_retry.is_err(), "completed a run it had handed back");
 }
 
-#[tokio::test]
-async fn failed_step_keeps_ownership_to_record_the_failure() {
+pub(super) async fn failed_step_keeps_ownership_to_record_the_failure() {
     let mut client = connect().await;
     let (run, attempt, _) = claim(&client, 1.0).await;
     sleep(0.5).await;
@@ -115,8 +113,7 @@ async fn failed_step_keeps_ownership_to_record_the_failure() {
         .expect("could not record the failure");
 }
 
-#[tokio::test]
-async fn step_saves_after_outlasting_its_lease() {
+pub(super) async fn step_saves_after_outlasting_its_lease() {
     let mut client = connect().await;
     let (run, attempt, _) = claim(&client, 1.0).await;
 
@@ -139,8 +136,7 @@ async fn step_saves_after_outlasting_its_lease() {
     tx.commit().await.unwrap();
 }
 
-#[tokio::test]
-async fn expired_lease_cannot_start_a_step() {
+pub(super) async fn expired_lease_cannot_start_a_step() {
     let client = connect().await;
     let (run, attempt, _) = claim(&client, 0.2).await;
     sleep(0.4).await;
@@ -154,8 +150,7 @@ async fn expired_lease_cannot_start_a_step() {
     assert!(late.is_err(), "started a step after the lease expired");
 }
 
-#[tokio::test]
-async fn completed_step_replays_its_output() {
+pub(super) async fn completed_step_replays_its_output() {
     let client = connect().await;
     let (run, attempt, _) = claim(&client, 30.0).await;
     assert_eq!(begin_step(&client, run, attempt, "once").await, None);

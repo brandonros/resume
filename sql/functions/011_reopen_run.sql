@@ -13,6 +13,12 @@ begin
         raise exception 'run % is not failed', p_run_id using errcode = '55000';
     end if;
 
+    -- A failed run with a handler has already handed responsibility to that workflow.
+    if (select on_failure_workflow is not null from resume.runs where id = p_run_id) then
+        raise exception 'run % has dispatched its failure handler and cannot resume; reopen the failed handler instead',
+            p_run_id using errcode = '55000';
+    end if;
+
     select idempotency_key into v_step from resume.steps
     where run_id = p_run_id and completed_at is null;
     if found then

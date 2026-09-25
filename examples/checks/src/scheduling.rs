@@ -1,4 +1,4 @@
-//! Relative and absolute scheduling through Producer and the SQL claim query. Run with `just test`.
+//! Relative and absolute scheduling through Producer and the SQL claim query. Run with `just check`.
 
 use std::time::{Duration, SystemTime};
 
@@ -8,7 +8,8 @@ use serde_json::json;
 use tokio_postgres::{Client, NoTls};
 
 async fn connect() -> Client {
-    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL; run the tests with `just test`");
+    let url =
+        std::env::var("DATABASE_URL").expect("DATABASE_URL; run the checks with `just check`");
     let (client, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(connection);
     client
@@ -18,8 +19,7 @@ fn workflow(name: &str) -> String {
     format!("schedule-{name}-{}", std::process::id())
 }
 
-#[tokio::test]
-async fn delayed_runs_are_stored_but_only_claimed_when_due() {
+pub(super) async fn delayed_runs_are_stored_but_only_claimed_when_due() {
     let client = connect().await;
     let competitor = connect().await;
     let name = workflow("delay");
@@ -134,8 +134,7 @@ async fn delayed_runs_are_stored_but_only_claimed_when_due() {
     }
 }
 
-#[tokio::test]
-async fn earlier_deadline_fails_a_scheduled_run_without_claiming_it() {
+pub(super) async fn earlier_deadline_fails_a_scheduled_run_without_claiming_it() {
     let client = connect().await;
     let name = workflow("deadline");
     let run = Producer::new(&client, &name, "1")
@@ -184,8 +183,7 @@ async fn earlier_deadline_fails_a_scheduled_run_without_claiming_it() {
     assert_eq!(row.get::<_, String>(2), "the run passed its deadline");
 }
 
-#[tokio::test]
-async fn submission_rejects_invalid_schedules_and_zero_is_immediately_eligible() {
+pub(super) async fn submission_rejects_invalid_schedules_and_zero_is_immediately_eligible() {
     let client = connect().await;
     let name = workflow("validation");
     for delay in [
@@ -197,7 +195,7 @@ async fn submission_rejects_invalid_schedules_and_zero_is_immediately_eligible()
     ] {
         let error = client
             .query_one(
-                "select * from resume.submit_run($1, '1', 'key', '{}', 1, 1, 60, null, null, $2, null)",
+                "select * from resume.submit_run($1, '1', 'key', '{}', 1, 1, 60, null, null, $2, null, null, null)",
                 &[&name, &delay],
             )
             .await
@@ -212,7 +210,7 @@ async fn submission_rejects_invalid_schedules_and_zero_is_immediately_eligible()
         let error = client
             .query_one(
                 "select * from resume.submit_run($1, '1', 'key', '{}', 1, 1, 60, null, null,
-                                            $2, $3::text::timestamptz)",
+                                            $2, $3::text::timestamptz, null, null)",
                 &[&name, &delay, &at],
             )
             .await
@@ -233,7 +231,7 @@ async fn submission_rejects_invalid_schedules_and_zero_is_immediately_eligible()
 
     let run: i64 = client
         .query_one(
-            "select run_id from resume.submit_run($1, '1', 'key', '{}', 1, 1, 60, null, null, 0, null)",
+            "select run_id from resume.submit_run($1, '1', 'key', '{}', 1, 1, 60, null, null, 0, null, null, null)",
             &[&name],
         )
         .await
@@ -249,8 +247,7 @@ async fn submission_rejects_invalid_schedules_and_zero_is_immediately_eligible()
     );
 }
 
-#[tokio::test]
-async fn absolute_times_preserve_offsets_and_duplicate_submissions_keep_the_schedule() {
+pub(super) async fn absolute_times_preserve_offsets_and_duplicate_submissions_keep_the_schedule() {
     let client = connect().await;
     let name = workflow("absolute");
     let future: SystemTime = client
@@ -323,8 +320,7 @@ async fn absolute_times_preserve_offsets_and_duplicate_submissions_keep_the_sche
     }
 }
 
-#[tokio::test]
-async fn past_times_are_eligible_and_the_last_schedule_setter_wins() {
+pub(super) async fn past_times_are_eligible_and_the_last_schedule_setter_wins() {
     let client = connect().await;
     let name = workflow("past");
     let past = "2000-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
@@ -375,8 +371,7 @@ async fn past_times_are_eligible_and_the_last_schedule_setter_wins() {
     ).await.unwrap().get::<_, bool>(0));
 }
 
-#[tokio::test]
-async fn an_absolute_schedule_cannot_postpone_the_deadline() {
+pub(super) async fn an_absolute_schedule_cannot_postpone_the_deadline() {
     let client = connect().await;
     let name = workflow("absolute-deadline");
     let future: SystemTime = client

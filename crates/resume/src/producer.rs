@@ -35,6 +35,8 @@ pub struct Producer<'a, C: GenericClient> {
     deadline: Option<Duration>,
     delay: Duration,
     at: Option<SystemTime>,
+    on_failure_workflow: Option<String>,
+    on_failure_version: Option<String>,
 }
 
 pub struct Submitted {
@@ -56,12 +58,24 @@ impl<'a, C: GenericClient> Producer<'a, C> {
             deadline: None,
             delay: Duration::ZERO,
             at: None,
+            on_failure_workflow: None,
+            on_failure_version: None,
         }
     }
 
     /// Sets the retry policy for runs this producer creates.
     pub fn retry(mut self, retry: RetryPolicy) -> Self {
         self.retry = retry;
+        self
+    }
+
+    /// After terminal failure or operator cancellation, enqueue this workflow atomically.
+    /// Its input contains `failed_run`, `error`, and the original `input`.
+    /// The handler has its own three attempts; a failed handler can be reopened by an operator.
+    /// Like the retry policy, this only applies when the original run is first created.
+    pub fn on_failure(mut self, workflow: impl Into<String>, version: impl Into<String>) -> Self {
+        self.on_failure_workflow = Some(workflow.into());
+        self.on_failure_version = Some(version.into());
         self
     }
 
@@ -131,7 +145,7 @@ impl<'a, C: GenericClient> Producer<'a, C> {
         let row = self
             .client
             .query_one(
-                "select run_id, created from resume.submit_run($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                "select run_id, created from resume.submit_run($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
                 &[
                     &self.workflow,
                     &self.version,
@@ -144,6 +158,8 @@ impl<'a, C: GenericClient> Producer<'a, C> {
                     &self.deadline.map(|d| d.as_secs_f64()),
                     &self.delay.as_secs_f64(),
                     &self.at,
+                    &self.on_failure_workflow,
+                    &self.on_failure_version,
                 ],
             )
             .await?;
