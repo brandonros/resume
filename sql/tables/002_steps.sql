@@ -1,8 +1,15 @@
--- A row means the step completed. Results are immutable.
+-- A step's progress within a run. begin_step inserts the row in the step's transaction, so a
+-- failed step leaves nothing behind, except step_once, which commits the start before calling
+-- out. A row with no completed_at therefore means a step_once action may have run and its
+-- outcome is unknown. A completed step's output never changes.
 -- The key is unique within the run and must be stable across attempts; it may be dynamic.
 create table resume.steps (
     run_id bigint not null references resume.runs (id) on delete cascade,
     idempotency_key text not null check (idempotency_key <> ''),
-    output jsonb not null,
-    primary key (run_id, idempotency_key)
+    started_at timestamptz not null,
+    completed_at timestamptz,
+    -- A step whose output is JSON null stores 'null'::jsonb, so SQL null means not completed.
+    output jsonb,
+    primary key (run_id, idempotency_key),
+    check ((completed_at is null) = (output is null))
 );

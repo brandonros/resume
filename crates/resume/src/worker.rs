@@ -156,13 +156,14 @@ impl Worker {
             run.fail_run(&self.client, &error.to_string())
                 .await
                 .map(|()| "permanent; run failed".to_string())
-        } else {
-            run.fail_attempt(&self.client, &error.to_string())
+        } else if number >= i64::from(max) {
+            run.fail_run(&self.client, &error.to_string())
                 .await
-                .map(|delay| match delay {
-                    Some(seconds) => format!("retry in {seconds:.1}s"),
-                    None => "attempt limit reached; run failed".to_string(),
-                })
+                .map(|()| "attempt limit reached; run failed".to_string())
+        } else {
+            run.retry_run(&self.client, &error.to_string())
+                .await
+                .map(|seconds| format!("retry in {seconds:.1}s"))
         };
         match next {
             Ok(next) => tracing::warn!("run {id} attempt {number}/{max}: failed: {error}; {next}"),

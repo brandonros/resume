@@ -15,7 +15,7 @@ begin
     end if;
 
     -- Fail runs whose final attempt's lease expired, as after a crash. An attempt that returns
-    -- an error goes through fail_attempt instead. No attempt holds these claims, so this
+    -- an error goes through retry_run or fail_run instead. No attempt holds these claims, so this
     -- cannot go through fail_run. Skip locked runs so a busy worker cannot hold up claims.
     with exhausted as (
         select r.id

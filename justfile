@@ -26,9 +26,20 @@ onboard-schema:
 onboard-submit email plan="pro":
     cargo run -p onboard -- submit {{quote(email)}} {{quote(plan)}}
 
-# fault: crm_crash, charge_unavailable, charge_crash, charge_slow, email_unavailable or email_crash
-onboard-process fault="":
-    FAULT={{quote(fault)}} cargo run -p onboard -- work
+# faults: a plan such as "charge.crash=once" or "seed=7 latency_ms=100 email.error=0.2"
+onboard-process faults="":
+    FAULTS={{quote(faults)}} cargo run -p onboard -- work
+
+# Clears the onboard data, then onboards one customer per fault point, each firing once.
+onboard-each:
+    cargo run -q -p onboard -- each
+
+# Clears the onboard data, then onboards customers under random faults and signals.
+onboard-chaos seed="1" customers="50" workers="3":
+    cargo run -q -p onboard -- chaos {{seed}} {{customers}} {{workers}}
+
+onboard-check:
+    cargo run -q -p onboard -- check
 
 # Shows each run and what the mock vendors did.
 onboard-show:
@@ -36,7 +47,7 @@ onboard-show:
         -c "select r.id, r.idempotency_key as email, r.attempt, \
                 case when r.completed_at is not null then 'completed' \
                      when r.failed_at is not null then 'failed' else 'pending' end as status, \
-                (select count(*) from resume.steps s where s.run_id = r.id) as saved_steps, \
+                (select count(*) from resume.steps s where s.run_id = r.id and s.completed_at is not null) as saved_steps, \
                 r.last_error \
             from resume.runs r where r.workflow = 'onboard' order by r.id" \
         -c "select * from vendors.charges order by id" \

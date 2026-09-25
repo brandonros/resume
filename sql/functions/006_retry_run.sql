@@ -1,6 +1,5 @@
--- Records a failed attempt. Schedules the next attempt after an exponential backoff and
--- returns the delay in seconds, or fails the run and returns null when no attempts are left.
-create or replace function resume.fail_attempt(p_run_id bigint, p_attempt bigint, p_error text)
+-- Schedules the next attempt after a failed one and returns the delay in seconds.
+create or replace function resume.retry_run(p_run_id bigint, p_attempt bigint, p_error text)
 returns double precision
 language plpgsql
 as $$
@@ -10,11 +9,8 @@ declare
 begin
     perform resume.lock_run(p_run_id, p_attempt);
     select * into v_run from resume.runs where id = p_run_id;
-
     if v_run.attempt - v_run.released >= v_run.max_attempts then
-        update resume.runs set failed_at = clock_timestamp(), last_error = p_error
-        where id = p_run_id;
-        return null;
+        raise exception 'run % has no attempts left', p_run_id using errcode = '55000';
     end if;
 
     -- Double the delay for each attempt used, up to the maximum, then keep a random 50-100%

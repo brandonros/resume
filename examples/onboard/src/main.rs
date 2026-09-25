@@ -1,13 +1,20 @@
+mod chaos;
 mod mock_vendors;
+mod rng;
 
-use mock_vendors::{FAULTS, Vendors};
 use std::time::Duration;
+
+use mock_vendors::{Faults, Vendors};
 
 use resume::{Permanent, Producer, Result, Run, Worker, lock_resource, shutdown_signal};
 use serde_json::json;
 use tokio_postgres::{Client, NoTls};
 
 const SETUP_FEE_CENTS: i64 = 5000;
+
+// Short limits, so retries and recovery in the demo come quickly.
+pub const LEASE: Duration = Duration::from_secs(5);
+const STEP_TIMEOUT: Duration = Duration::from_secs(3);
 
 async fn onboard(client: &mut Client, run: &Run, v: &mut Vendors) -> Result<()> {
     let email = run.input["email"]
@@ -154,6 +161,14 @@ async fn onboard(client: &mut Client, run: &Run, v: &mut Vendors) -> Result<()> 
     Ok(())
 }
 
+fn passed(held: bool) -> Result<()> {
+    if held {
+        Ok(())
+    } else {
+        Err("invariants violated".into())
+    }
+}
+
 async fn connect(database_url: &str) -> Result<Client> {
     let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
     tokio::spawn(async move {
@@ -191,23 +206,31 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some("work") | None => {
-            let fault = std::env::var("FAULT").ok().filter(|f| !f.is_empty());
-            if let Some(fault) = &fault {
-                if !FAULTS.contains(&fault.as_str()) {
-                    return Err(format!("unknown FAULT {fault}; expected one of {FAULTS:?}").into());
-                }
-                tracing::warn!("injecting fault {fault}");
+            let spec = std::env::var("FAULTS").unwrap_or_default();
+            let faults = Faults::parse(&spec)?;
+            if !spec.trim().is_empty() {
+                tracing::warn!("fault plan: {spec}");
             }
-            let mut vendors = Vendors::new(connect(&database_url).await?, fault);
-            // Short limits, so retries and recovery in the demo come quickly.
+            let mut vendors = Vendors::new(connect(&database_url).await?, faults);
             Worker::new(client, "onboard")
-                .lease(Duration::from_secs(5))
-                .step_timeout(Duration::from_secs(3))
+                .lease(LEASE)
+                .step_timeout(STEP_TIMEOUT)
                 .run(shutdown_signal(), async |client, run| {
                     onboard(client, run, &mut vendors).await
                 })
                 .await
         }
-        _ => Err("expected submit <email> [plan] or work".into()),
+        Some("each") => passed(chaos::each(&client).await?),
+        Some("chaos") => {
+            let seed = args.next().map_or(Ok(1), |s| s.parse())?;
+            let customers = args.next().map_or(Ok(50), |s| s.parse())?;
+            let workers = args.next().map_or(Ok(3), |s| s.parse())?;
+            passed(chaos::random(&client, seed, customers, workers).await?)
+        }
+        Some("check") => passed(chaos::check(&client).await?),
+        _ => Err(
+            "expected submit <email> [plan], work, each, chaos [seed] [customers] [workers], or check"
+                .into(),
+        ),
     }
 }

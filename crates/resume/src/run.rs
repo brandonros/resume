@@ -29,7 +29,7 @@ impl Run {
         idempotency_key: &str,
         action: impl AsyncFnOnce(&Transaction<'_>) -> Result<Value>,
     ) -> Result<Value> {
-        let (tx, existing) = self.begin_step(client, idempotency_key).await?;
+        let (tx, existing, _) = self.begin_step(client, idempotency_key).await?;
         if let Some(output) = existing {
             tx.commit().await?;
             tracing::info!("run {} step {idempotency_key}: using saved result", self.id);
@@ -57,7 +57,7 @@ impl Run {
         check: impl AsyncFnOnce(&mut C, &Transaction<'_>) -> Result<Option<Value>>,
         action: impl AsyncFnOnce(&mut C, &Transaction<'_>) -> Result<Value>,
     ) -> Result<Value> {
-        let (tx, existing) = self.begin_step(client, idempotency_key).await?;
+        let (tx, existing, _) = self.begin_step(client, idempotency_key).await?;
         if let Some(output) = existing {
             tx.commit().await?;
             tracing::info!("run {} step {idempotency_key}: using saved result", self.id);
@@ -94,14 +94,14 @@ impl Run {
         idempotency_key: &str,
         action: impl AsyncFnOnce() -> Result<Value>,
     ) -> Result<Value> {
-        let (tx, existing) = self.begin_step(client, idempotency_key).await?;
+        let (tx, existing, interrupted) = self.begin_step(client, idempotency_key).await?;
         if let Some(output) = existing {
             tx.commit().await?;
             tracing::info!("run {} step {idempotency_key}: using saved result", self.id);
             return Ok(output);
         }
 
-        if !self.start_step(&tx, idempotency_key).await? {
+        if interrupted {
             let error = RunFailed(format!(
                 "step {idempotency_key} started in an earlier attempt and its outcome is unknown"
             ));
@@ -127,25 +127,25 @@ impl Run {
     }
 
     /// Starts a transaction holding the run's lock, after checking this attempt owns it, and
-    /// renews the lease. Returns the step's saved output if it already completed.
+    /// records the step's start. Returns the step's saved output if it already completed, and
+    /// whether an earlier attempt started it without completing it.
     async fn begin_step<'c>(
         &self,
         client: &'c mut Client,
         key: &str,
-    ) -> Result<(Transaction<'c>, Option<Value>)> {
+    ) -> Result<(Transaction<'c>, Option<Value>, bool)> {
         // A stopping worker lets the step in progress finish and starts no more.
         if self.stopping.load(Ordering::Relaxed) {
             return Err(Stopping.into());
         }
         let tx = client.transaction().await?;
-        let existing = tx
+        let row = tx
             .query_one(
-                "select resume.begin_step($1, $2, $3, $4)",
+                "select output, interrupted from resume.begin_step($1, $2, $3, $4)",
                 &[&self.id, &self.attempt, &key, &self.lease.as_secs_f64()],
             )
-            .await?
-            .try_get(0)?;
-        Ok((tx, existing))
+            .await?;
+        Ok((tx, row.try_get("output")?, row.try_get("interrupted")?))
     }
 
     /// Fails the step if its action takes longer than the step timeout. Timing out stops the
@@ -156,16 +156,6 @@ impl Run {
             Ok(result) => result,
             Err(_) => Err(format!("step {key} timed out after {:?}", self.step_timeout).into()),
         }
-    }
-
-    async fn start_step(&self, tx: &Transaction<'_>, key: &str) -> Result<bool> {
-        Ok(tx
-            .query_one(
-                "select resume.start_step($1, $2, $3)",
-                &[&self.id, &self.attempt, &key],
-            )
-            .await?
-            .try_get(0)?)
     }
 
     async fn save_step(&self, db: &impl GenericClient, key: &str, output: &Value) -> Result<Value> {
@@ -196,15 +186,11 @@ impl Run {
         Ok(())
     }
 
-    /// Returns the delay before the next attempt, or None if the run failed.
-    pub(crate) async fn fail_attempt(
-        &self,
-        db: &impl GenericClient,
-        error: &str,
-    ) -> Result<Option<f64>> {
+    /// Returns the delay in seconds before the next attempt.
+    pub(crate) async fn retry_run(&self, db: &impl GenericClient, error: &str) -> Result<f64> {
         Ok(db
             .query_one(
-                "select resume.fail_attempt($1, $2, $3)",
+                "select resume.retry_run($1, $2, $3)",
                 &[&self.id, &self.attempt, &error],
             )
             .await?
