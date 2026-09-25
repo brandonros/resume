@@ -12,12 +12,17 @@ test:
     dropdb --if-exists --force --maintenance-db "{{server}}/postgres" resume_test
     createdb --maintenance-db "{{server}}/postgres" resume_test
     psql "{{server}}/resume_test" -X -q -v ON_ERROR_STOP=1 --single-transaction \
-        $(printf ' -f %s' sql/tables/*.sql sql/functions/*.sql)
+        $(printf ' -f %s' sql/tables/*.sql sql/functions/*.sql sql/views/*.sql)
     DATABASE_URL="{{server}}/resume_test" cargo test --workspace -q
 
 schema:
     psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction \
-        $(printf ' -f %s' sql/tables/*.sql sql/functions/*.sql)
+        $(printf ' -f %s' sql/tables/*.sql sql/functions/*.sql sql/views/*.sql)
+
+# Installs or refreshes the inspection views on an existing schema.
+views:
+    psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction \
+        $(printf ' -f %s' sql/views/*.sql)
 
 # For operators: after checking the vendor, record an interrupted step_once step's output and
 # continue the run, e.g. just resolve-step 7 send_welcome_email 42
