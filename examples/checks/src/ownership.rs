@@ -1,41 +1,22 @@
 //! Ownership rules of the SQL functions: which attempt may start steps, save them, and record
 //! how it ended. Needs a database with the resume schema in DATABASE_URL; `just check` creates one.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 
-async fn connect() -> Client {
-    let url =
-        std::env::var("DATABASE_URL").expect("DATABASE_URL; run the checks with `just check`");
-    let (client, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
-    tokio::spawn(connection);
-    client
-}
+use crate::common::{claim, claim_with, complete, connect, end_attempt, submit, workflow};
 
-/// Submits a run to a workflow of its own and claims it. Returns the run's ID, the attempt, and
-/// the workflow.
-async fn claim(client: &Client, lease_seconds: f64) -> (i64, i64, String) {
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let workflow = format!("test-{}-{n}", std::process::id());
-    client
-        .execute(
-            "select resume.submit_run($1, '1', 'key', '{}', 3, 1, 60, null, null, 0, null, null, null)",
-            &[&workflow],
-        )
+/// Submits a run to a workflow of its own and claims it with this lease. Returns the run's ID,
+/// the attempt, and the workflow.
+async fn claimed(client: &Client, lease_seconds: f64) -> (i64, i64, String) {
+    let workflow = workflow("ownership");
+    submit(client, &workflow).await;
+    let (run, attempt) = claim_with(client, &workflow, "1", lease_seconds)
         .await
         .unwrap();
-    let row = client
-        .query_one(
-            "select id, attempt from resume.claim_run($1, '1', $2)",
-            &[&workflow, &lease_seconds],
-        )
-        .await
-        .unwrap();
-    (row.get(0), row.get(1), workflow)
+    (run, attempt, workflow)
 }
 
 async fn begin_step(client: &Client, run: i64, attempt: i64, key: &str) -> Option<Value> {
@@ -55,41 +36,31 @@ async fn sleep(seconds: f64) {
 
 pub(super) async fn new_claim_rejects_previous_attempt() {
     let client = connect().await;
-    let (run, first, workflow) = claim(&client, 0.2).await;
+    let (run, first, workflow) = claimed(&client, 0.2).await;
     sleep(0.3).await;
-    let second: i64 = client
-        .query_one(
-            "select attempt from resume.claim_run($1, '1', 30)",
-            &[&workflow],
-        )
-        .await
-        .unwrap()
-        .get(0);
+    let (_, second) = claim(&client, &workflow).await.unwrap();
     assert_eq!(second, first + 1);
-
-    let old = client
-        .execute("select resume.complete_run($1, $2)", &[&run, &first])
-        .await;
-    assert!(old.is_err(), "the replaced attempt completed the run");
+    assert!(
+        complete(&client, run, first).await.is_err(),
+        "the replaced attempt completed the run"
+    );
 }
 
 pub(super) async fn attempt_that_handed_back_the_run_cannot_complete_it() {
     let client = connect().await;
-    let (run, attempt, _) = claim(&client, 30.0).await;
-    client
-        .execute("select resume.retry_run($1, $2, 'boom')", &[&run, &attempt])
+    let (run, attempt, _) = claimed(&client, 30.0).await;
+    end_attempt(&client, run, attempt, "boom", false)
         .await
         .unwrap();
-
-    let after_retry = client
-        .execute("select resume.complete_run($1, $2)", &[&run, &attempt])
-        .await;
-    assert!(after_retry.is_err(), "completed a run it had handed back");
+    assert!(
+        complete(&client, run, attempt).await.is_err(),
+        "completed a run it had handed back"
+    );
 }
 
 pub(super) async fn failed_step_keeps_ownership_to_record_the_failure() {
     let mut client = connect().await;
-    let (run, attempt, _) = claim(&client, 1.0).await;
+    let (run, attempt, _) = claimed(&client, 1.0).await;
     sleep(0.5).await;
 
     // The step renews the lease, then fails and rolls back, restoring the older lease, which
@@ -104,18 +75,14 @@ pub(super) async fn failed_step_keeps_ownership_to_record_the_failure() {
     sleep(0.7).await;
     tx.rollback().await.unwrap();
 
-    client
-        .execute(
-            "select resume.fail_run($1, $2, 'permanent')",
-            &[&run, &attempt],
-        )
+    end_attempt(&client, run, attempt, "permanent", true)
         .await
         .expect("could not record the failure");
 }
 
 pub(super) async fn step_saves_after_outlasting_its_lease() {
     let mut client = connect().await;
-    let (run, attempt, _) = claim(&client, 1.0).await;
+    let (run, attempt, _) = claimed(&client, 1.0).await;
 
     // The step holds the run's lock the whole time, so no one else can claim it, even after
     // the lease runs out, as when waiting for another run's subject lock.
@@ -138,7 +105,7 @@ pub(super) async fn step_saves_after_outlasting_its_lease() {
 
 pub(super) async fn expired_lease_cannot_start_a_step() {
     let client = connect().await;
-    let (run, attempt, _) = claim(&client, 0.2).await;
+    let (run, attempt, _) = claimed(&client, 0.2).await;
     sleep(0.4).await;
 
     let late = client
@@ -152,7 +119,7 @@ pub(super) async fn expired_lease_cannot_start_a_step() {
 
 pub(super) async fn completed_step_replays_its_output() {
     let client = connect().await;
-    let (run, attempt, _) = claim(&client, 30.0).await;
+    let (run, attempt, _) = claimed(&client, 30.0).await;
     assert_eq!(begin_step(&client, run, attempt, "once").await, None);
     client
         .execute(
@@ -166,4 +133,38 @@ pub(super) async fn completed_step_replays_its_output() {
         begin_step(&client, run, attempt, "once").await,
         Some(json!({"n": 1}))
     );
+}
+
+pub(super) async fn passing_the_deadline_fails_the_run_without_starting_the_step() {
+    let client = connect().await;
+    let (run, attempt, _) = claimed(&client, 30.0).await;
+    client
+        .execute(
+            "update resume.runs set deadline_at = clock_timestamp() where id = $1",
+            &[&run],
+        )
+        .await
+        .unwrap();
+
+    let failed: Option<String> = client
+        .query_one(
+            "select failed from resume.begin_step($1, $2, 'late', 0, 30)",
+            &[&run, &attempt],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(failed.as_deref(), Some("the run passed its deadline"));
+    let row = client
+        .query_one(
+            "select needs_resolution, status from resume.run_status where id = $1",
+            &[&run],
+        )
+        .await
+        .unwrap();
+    assert!(
+        !row.get::<_, bool>(0),
+        "a step that never ran needs resolution"
+    );
+    assert_eq!(row.get::<_, &str>(1), "failed");
 }

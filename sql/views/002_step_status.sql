@@ -6,7 +6,7 @@ select
     s.run_id,
     r.workflow,
     r.version,
-    s.idempotency_key,
+    s.key,
     s.position,
     case
         when s.completed_at is not null then 'completed'

@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use harness::{Pool, Rng, check_history, check_invariants, log_files, pending, signal};
+use harness::{Pool, Rng, check_invariants, log_files, signal};
 use resume::{Producer, Result, RetryPolicy};
 use serde_json::json;
 use tokio_postgres::Client;
@@ -76,8 +76,13 @@ pub async fn each(client: &Client) -> Result<bool> {
             error.unwrap_or_default()
         );
     }
-    let history = check_history(Path::new("target/chaos/each"))?;
-    Ok(check(client).await? && history)
+    harness::verify(
+        client,
+        "onboard",
+        INVARIANTS,
+        Path::new("target/chaos/each"),
+    )
+    .await
 }
 
 /// Onboards `customers` under random vendor faults while randomly killing workers, stopping
@@ -120,65 +125,66 @@ pub async fn random(client: &Client, seed: u64, customers: usize, workers: usize
     let (mut kills, mut terms, mut freezes, mut resubmits) = (0, 0, 0, 0);
     let mut duplicate_run = false;
     let start = Instant::now();
-    loop {
-        let now = Instant::now();
-        pool.reap();
-        pool.thaw(now);
-        // Like a process manager with liveness probes, replace workers that are frozen, whether
-        // by a signal or by a freeze fault.
-        pool.notice_frozen(now + LEASE * 4);
-        while pool.running() < workers {
-            pool.spawn(&[("FAULTS", &plan(pool.spawned + 1))])?;
-        }
+    harness::drive(
+        client,
+        "onboard",
+        LIMIT,
+        Duration::from_millis(200),
+        async || {
+            let now = Instant::now();
+            pool.reap();
+            pool.thaw(now);
+            // Like a process manager with liveness probes, replace workers that are frozen, whether
+            // by a signal or by a freeze fault.
+            pool.notice_frozen(now + LEASE * 4);
+            while pool.running() < workers {
+                pool.spawn(&[("FAULTS", &plan(pool.spawned + 1))])?;
+            }
 
-        if now - start < CHAOS_FOR {
-            let running: Vec<usize> = (0..pool.workers.len())
-                .filter(|&i| pool.workers[i].frozen_until.is_none())
-                .collect();
-            if !running.is_empty() && rng.chance(0.1) {
-                let worker = &mut pool.workers[running[rng.below(running.len() as u64) as usize]];
-                match rng.below(3) {
-                    0 => {
-                        signal(&worker.child, "-KILL");
-                        kills += 1;
-                    }
-                    1 => {
-                        signal(&worker.child, "-TERM");
-                        terms += 1;
-                    }
-                    _ => {
-                        // Past the lease, so another worker can take over its run. A third of
-                        // freezes last long enough that only Postgres's timeouts free the run.
-                        signal(&worker.child, "-STOP");
-                        let freeze = if rng.chance(1.0 / 3.0) {
-                            LEASE * 4
-                        } else {
-                            LEASE + Duration::from_millis(1000 + rng.below(2000))
-                        };
-                        worker.frozen_until = Some(now + freeze);
-                        freezes += 1;
+            if now - start < CHAOS_FOR {
+                let running: Vec<usize> = (0..pool.workers.len())
+                    .filter(|&i| pool.workers[i].frozen_until.is_none())
+                    .collect();
+                if !running.is_empty() && rng.chance(0.1) {
+                    let worker =
+                        &mut pool.workers[running[rng.below(running.len() as u64) as usize]];
+                    match rng.below(3) {
+                        0 => {
+                            signal(&worker.child, "-KILL");
+                            kills += 1;
+                        }
+                        1 => {
+                            signal(&worker.child, "-TERM");
+                            terms += 1;
+                        }
+                        _ => {
+                            // Past the lease, so another worker can take over its run. A third of
+                            // freezes last long enough that only Postgres's timeouts free the run.
+                            signal(&worker.child, "-STOP");
+                            let freeze = if rng.chance(1.0 / 3.0) {
+                                LEASE * 4
+                            } else {
+                                LEASE + Duration::from_millis(1000 + rng.below(2000))
+                            };
+                            worker.frozen_until = Some(now + freeze);
+                            freezes += 1;
+                        }
                     }
                 }
-            }
-            if rng.chance(0.05) {
-                let (email, input) = &inputs[rng.below(inputs.len() as u64) as usize];
-                if producer.submit(email, input).await?.created {
-                    println!("VIOLATION: submitting {email} again created a second run");
-                    duplicate_run = true;
+                if rng.chance(0.05) {
+                    let (email, input) = &inputs[rng.below(inputs.len() as u64) as usize];
+                    if producer.submit(email, input).await?.created {
+                        println!("VIOLATION: submitting {email} again created a second run");
+                        duplicate_run = true;
+                    }
+                    resubmits += 1;
                 }
-                resubmits += 1;
             }
-        }
 
-        if pending(client, "onboard").await? == 0 {
-            break;
-        }
-        if now - start > LIMIT {
-            println!("stopped waiting after {LIMIT:?}");
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+            Ok(())
+        },
+    )
+    .await?;
     pool.stop().await;
 
     println!(
@@ -196,8 +202,7 @@ pub async fn random(client: &Client, seed: u64, customers: usize, workers: usize
         .collect();
     println!("faults fired: {}", fired.join(", "));
     println!("logs: {}", pool.logs.display());
-    let history = check_history(&pool.logs)?;
-    Ok(check(client).await? && history && !duplicate_run)
+    Ok(harness::verify(client, "onboard", INVARIANTS, &pool.logs).await? && !duplicate_run)
 }
 
 /// Starts `workers` workers, then has `producers` producers, each on its own connection, all
@@ -224,7 +229,7 @@ pub async fn race(
     for n in 0..producers {
         let database_url = database_url.to_string();
         tasks.spawn(async move {
-            let client = crate::connect(&database_url).await?;
+            let client = harness::connect(&database_url).await?;
             let producer = Producer::new(&client, "onboard", crate::VERSION).retry(RETRY);
             let mut order: Vec<usize> = (0..customers).collect();
             let mut rng = Rng::new(n as u64);
@@ -261,9 +266,14 @@ pub async fn race(
     }
     let submitted = start.elapsed();
 
-    while pending(client, "onboard").await? > 0 && start.elapsed() < LIMIT {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    harness::drive(
+        client,
+        "onboard",
+        LIMIT,
+        Duration::from_millis(100),
+        async || Ok(()),
+    )
+    .await?;
     let elapsed = start.elapsed();
     pool.stop().await;
 
@@ -278,8 +288,7 @@ pub async fn race(
     if held {
         println!("submits: every key created exactly one run");
     }
-    let history = check_history(&pool.logs)?;
-    Ok(check(client).await? && history && held)
+    Ok(harness::verify(client, "onboard", INVARIANTS, &pool.logs).await? && held)
 }
 
 pub async fn check(client: &Client) -> Result<bool> {
@@ -288,14 +297,13 @@ pub async fn check(client: &Client) -> Result<bool> {
 
 /// Clears the example's data, so the invariants see only this test.
 async fn reset(client: &Client) -> Result<()> {
-    client
-        .batch_execute(
-            "truncate onboard.customers, vendors.crm_contacts, vendors.billing_customers,
-                 vendors.charges, vendors.emails, vendors.slack_messages restart identity;
-             delete from resume.runs where workflow = 'onboard';",
-        )
-        .await?;
-    Ok(())
+    harness::reset(
+        client,
+        "onboard",
+        "onboard.customers, vendors.crm_contacts, vendors.billing_customers, vendors.charges,
+         vendors.emails, vendors.slack_messages",
+    )
+    .await
 }
 
 fn points() -> impl Iterator<Item = String> {

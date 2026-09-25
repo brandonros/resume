@@ -1,4 +1,5 @@
 //! Runnable regression scenarios against a fresh PostgreSQL database. Run with `just check`.
+mod common;
 mod ownership;
 mod recovery;
 mod scheduling;
@@ -21,6 +22,7 @@ async fn main() {
     check!(ownership::step_saves_after_outlasting_its_lease);
     check!(ownership::expired_lease_cannot_start_a_step);
     check!(ownership::completed_step_replays_its_output);
+    check!(ownership::passing_the_deadline_fails_the_run_without_starting_the_step);
     check!(scheduling::delayed_runs_are_stored_but_only_claimed_when_due);
     check!(scheduling::earlier_deadline_fails_a_scheduled_run_without_claiming_it);
     check!(scheduling::submission_rejects_invalid_schedules_and_zero_is_immediately_eligible);
@@ -35,6 +37,7 @@ async fn main() {
     check!(recovery::every_terminal_path_queues_the_handler);
     check!(recovery::success_retry_and_snooze_do_not_queue_handlers);
     check!(recovery::failed_handler_reopens_with_saved_progress);
+    check!(recovery::reserved_handler_keys_cannot_be_submitted);
     check!(recovery::worker_exhaustion_queues_handler_without_step_output);
-    println!("All 21 checks passed.");
+    println!("All 23 checks passed.");
 }

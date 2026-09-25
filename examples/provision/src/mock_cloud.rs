@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use harness::Rng;
 use resume::Result;
 use tokio_postgres::Client;
@@ -28,7 +26,7 @@ impl Cloud {
 
     /// The VM created for a request, found by the tag the create call sets.
     pub async fn find_vm(&mut self, request_id: &str) -> Result<Option<i64>> {
-        self.delay().await;
+        self.rng.pause(self.latency_ms).await;
         let row = self
             .client
             .query_opt(
@@ -40,7 +38,7 @@ impl Cloud {
     }
 
     pub async fn count_vms(&mut self, team: &str) -> Result<i64> {
-        self.delay().await;
+        self.rng.pause(self.latency_ms).await;
         Ok(self
             .client
             .query_one("select count(*) from cloud.vms where team = $1", &[&team])
@@ -49,7 +47,7 @@ impl Cloud {
     }
 
     pub async fn create_vm(&mut self, team: &str, request_id: &str) -> Result<i64> {
-        self.delay().await;
+        self.rng.pause(self.latency_ms).await;
         let id: i64 = self
             .client
             .query_one(
@@ -64,12 +62,5 @@ impl Cloud {
             std::process::exit(1);
         }
         Ok(id)
-    }
-
-    async fn delay(&mut self) {
-        if self.latency_ms > 0 {
-            let ms = self.rng.below(self.latency_ms + 1);
-            tokio::time::sleep(Duration::from_millis(ms)).await;
-        }
     }
 }

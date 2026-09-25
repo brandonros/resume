@@ -2,17 +2,16 @@ use std::time::Duration;
 
 use resume::{Producer, Result, RetryPolicy, Run, Worker, shutdown_signal};
 use serde_json::json;
-use tokio_postgres::{Client, NoTls};
 
 /// The version of this workflow's input and steps; producers and workers must agree.
 pub const VERSION: &str = "1";
 
-async fn counter(client: &mut Client, run: &Run) -> Result<()> {
+async fn counter(run: &Run) -> Result<()> {
     let amount = run.input["amount"]
         .as_i64()
         .ok_or("amount must be an integer")?;
 
-    run.step(client, "create", async |tx| {
+    run.step("create", async |tx| {
         tx.execute(
             "insert into counter.results (run_id, value) values ($1, 0)",
             &[&run.id],
@@ -22,7 +21,7 @@ async fn counter(client: &mut Client, run: &Run) -> Result<()> {
     })
     .await?;
 
-    run.step(client, "add", async |tx| {
+    run.step("add", async |tx| {
         let row = tx
             .query_one(
                 "update counter.results set value = value + $2
@@ -37,7 +36,7 @@ async fn counter(client: &mut Client, run: &Run) -> Result<()> {
     .await?;
 
     let output = run
-        .step(client, "double", async |tx| {
+        .step("double", async |tx| {
             let row = tx
                 .query_one(
                     "update counter.results set value = value * 2
@@ -56,18 +55,7 @@ async fn counter(client: &mut Client, run: &Run) -> Result<()> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .init();
-
-    let (client, connection) =
-        tokio_postgres::connect(&std::env::var("DATABASE_URL")?, NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(error) = connection.await {
-            tracing::error!("postgres: {error}");
-        }
-    });
+    let (_, client) = harness::start().await?;
 
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {

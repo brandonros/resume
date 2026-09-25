@@ -1,5 +1,6 @@
 -- Returns the run for this key, creating it if needed. A key maps to one run for good,
--- even after that run fails, so a step_once action cannot repeat through a new run.
+-- even after that run fails, so a step_once action cannot repeat through a new run. Keys
+-- starting with 'resume:' are reserved for runs resume creates, such as failure handlers.
 create or replace function resume.submit_run(
     p_workflow text,
     p_version text,
@@ -23,6 +24,10 @@ declare
     v_now timestamptz := clock_timestamp();
     v_deadline_at timestamptz := v_now + make_interval(secs => p_deadline_seconds);
 begin
+    if p_idempotency_key like 'resume:%' then
+        raise exception 'idempotency key % is reserved: keys starting with resume: belong to resume',
+            p_idempotency_key using errcode = '22023';
+    end if;
     if p_delay_seconds is null or p_delay_seconds < 0
        or p_delay_seconds >= 'Infinity'::double precision then
         raise exception 'submit delay seconds must be finite and nonnegative' using errcode = '22023';

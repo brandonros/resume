@@ -20,6 +20,14 @@ impl Rng {
         ((self.next_u64() >> 11) as f64 / (1u64 << 53) as f64) < p
     }
 
+    /// Waits a random time of up to `max_ms`, to widen race windows.
+    pub async fn pause(&mut self, max_ms: u64) {
+        if max_ms > 0 {
+            let ms = self.below(max_ms + 1);
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
+    }
+
     /// A number in `0..n`.
     pub fn below(&mut self, n: u64) -> u64 {
         self.next_u64() % n

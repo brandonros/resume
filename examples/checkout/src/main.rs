@@ -7,32 +7,31 @@ use resume::{Permanent, Producer, Result, Run, Worker, shutdown_signal};
 use serde_json::json;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
-use tokio_postgres::{Client, NoTls};
 
 const VERSION: &str = "1";
 const WORKFLOWS: [&str; 2] = ["checkout", "checkout_failure"];
 
-async fn checkout(client: &mut Client, run: &Run, vendor: &mut MockVendor) -> Result<()> {
+async fn checkout(run: &Run, vendor: &mut MockVendor) -> Result<()> {
     let order = run.input["order"].as_str().ok_or("missing order")?;
-    run.step(client, "charge", async |_| {
+    run.step("charge", async |_| {
         vendor.apply(order, "payment", "charge").await?;
         Ok(json!({"charged": true}))
     })
     .await?;
-    run.step(client, "reserve", async |_| {
+    run.step("reserve", async |_| {
         vendor.apply(order, "reservation", "reserve").await?;
         Ok(json!({"reserved": true}))
     })
     .await?;
 
-    run.step(client, "ship", async |_| {
+    run.step("ship", async |_| {
         Err(Permanent("shipping rejected the order".into()).into())
     })
     .await?;
     Ok(())
 }
 
-async fn undo(client: &mut Client, run: &Run, vendor: &mut MockVendor, refund: bool) -> Result<()> {
+async fn undo(run: &Run, vendor: &mut MockVendor, refund: bool) -> Result<()> {
     let args = &run.input["input"];
     let order = args["order"].as_str().ok_or("missing original order")?;
     let (kind, action) = if refund {
@@ -40,7 +39,7 @@ async fn undo(client: &mut Client, run: &Run, vendor: &mut MockVendor, refund: b
     } else {
         ("reservation", "release")
     };
-    run.step(client, action, async |_| {
+    run.step(action, async |_| {
         vendor.undo(order, kind, action).await?;
         if refund && args["crash_refund"] == true && vendor.first_refund_crash(order).await? {
             // The vendor committed the refund, but the step has not saved its result yet.
@@ -56,7 +55,7 @@ async fn undo(client: &mut Client, run: &Run, vendor: &mut MockVendor, refund: b
     Ok(())
 }
 
-async fn notify_failure(client: &mut Client, run: &Run) -> Result<()> {
+async fn notify_failure(run: &Run) -> Result<()> {
     let failed_run = run.input["failed_run"]
         .as_i64()
         .ok_or("missing failed run")?;
@@ -66,7 +65,7 @@ async fn notify_failure(client: &mut Client, run: &Run) -> Result<()> {
     let reason = run.input["error"]
         .as_str()
         .ok_or("missing failure reason")?;
-    run.step(client, "notify", async |tx| {
+    run.step("notify", async |tx| {
         let unfinished: bool = tx.query_one(
             "select exists (select 1 from checkout.effects where order_key = $1 and not undone)",
             &[&order],
@@ -86,23 +85,13 @@ async fn notify_failure(client: &mut Client, run: &Run) -> Result<()> {
     Ok(())
 }
 
-async fn connect(url: &str) -> Result<Client> {
-    let (client, connection) = tokio_postgres::connect(url, NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(error) = connection.await {
-            tracing::error!("postgres: {error}");
-        }
-    });
-    Ok(client)
-}
-
 async fn work(url: &str) -> Result<()> {
     // The failure handler is an ordinary workflow with its own saved steps and retries.
     let (stop, stopping) = watch::channel(false);
     let mut workers = JoinSet::new();
     for workflow in WORKFLOWS {
-        let client = connect(url).await?;
-        let mut vendor = MockVendor::new(connect(url).await?);
+        let client = harness::connect(url).await?;
+        let mut vendor = MockVendor::new(harness::connect(url).await?);
         let mut stopping = stopping.clone();
         workers.spawn_local(async move {
             Worker::new(client, workflow, VERSION)
@@ -117,12 +106,12 @@ async fn work(url: &str) -> Result<()> {
                             }
                         }
                     },
-                    async |client, run| match workflow {
-                        "checkout" => checkout(client, run, &mut vendor).await,
+                    async |run| match workflow {
+                        "checkout" => checkout(run, &mut vendor).await,
                         _ => {
-                            undo(client, run, &mut vendor, false).await?;
-                            undo(client, run, &mut vendor, true).await?;
-                            notify_failure(client, run).await
+                            undo(run, &mut vendor, false).await?;
+                            undo(run, &mut vendor, true).await?;
+                            notify_failure(run).await
                         }
                     },
                 )
@@ -149,11 +138,7 @@ async fn work(url: &str) -> Result<()> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .init();
-    let url = std::env::var("DATABASE_URL")?;
+    let (url, client) = harness::start().await?;
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("submit") => {
@@ -164,7 +149,6 @@ async fn main() -> Result<()> {
             if !matches!(mode.as_str(), "fail" | "crash-refund") {
                 return Err("mode must be fail or crash-refund".into());
             }
-            let client = connect(&url).await?;
             let submitted = Producer::new(&client, "checkout", VERSION)
                 .on_failure("checkout_failure", VERSION)
                 .submit(

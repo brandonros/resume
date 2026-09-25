@@ -3,134 +3,88 @@
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, FixedOffset, Utc};
-use resume::Producer;
+use resume::{Producer, Submitted};
 use serde_json::json;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 
-async fn connect() -> Client {
-    let url =
-        std::env::var("DATABASE_URL").expect("DATABASE_URL; run the checks with `just check`");
-    let (client, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
-    tokio::spawn(connection);
-    client
+use crate::common::{claim, complete, connect, make_due, pass_deadline, run_is, workflow};
+
+/// Submits through `submit`, or through `submit_for` when there is a subject.
+async fn submit_as(producer: &Producer<'_, Client>, subject: Option<&str>, key: &str) -> Submitted {
+    match subject {
+        None => producer.submit(key, &json!({})).await,
+        Some(subject) => producer.submit_for(subject, key, &json!({})).await,
+    }
+    .unwrap()
 }
 
-fn workflow(name: &str) -> String {
-    format!("schedule-{name}-{}", std::process::id())
+async fn available_at(client: &Client, run: i64) -> SystemTime {
+    client
+        .query_one(
+            "select available_at from resume.runs where id = $1",
+            &[&run],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
+/// Two hours from now by the database's clock.
+async fn in_two_hours(client: &Client) -> SystemTime {
+    client
+        .query_one("select clock_timestamp() + interval '2 hours'", &[])
+        .await
+        .unwrap()
+        .get(0)
 }
 
 pub(super) async fn delayed_runs_are_stored_but_only_claimed_when_due() {
     let client = connect().await;
     let competitor = connect().await;
     let name = workflow("delay");
+    let delayed = |seconds| Producer::new(&client, &name, "1").delay(Duration::from_secs(seconds));
 
     // Exercise both submission APIs, including a duplicate with a different delay.
     for subject in [None, Some("customer:42")] {
         let key = subject.unwrap_or("plain");
-        let producer = Producer::new(&client, &name, "1").delay(Duration::from_secs(300));
-        let submitted = match subject {
-            None => producer.submit(key, &json!({})).await,
-            Some(subject) => producer.submit_for(subject, key, &json!({})).await,
-        }
-        .unwrap();
+        let submitted = submit_as(&delayed(300), subject, key).await;
         assert!(submitted.created);
-        let row = client
-            .query_one(
-                "select available_at::text, attempt, leased,
-                    available_at > clock_timestamp() + interval '4 minutes' as future
-             from resume.runs where id = $1",
-                &[&submitted.id],
+        assert!(
+            run_is(
+                &client,
+                submitted.id,
+                "attempt = 0 and not leased
+                 and available_at > clock_timestamp() + interval '4 minutes'"
             )
             .await
-            .unwrap();
-        let schedule: String = row.get(0);
-        assert_eq!(row.get::<_, i64>(1), 0);
-        assert!(!row.get::<_, bool>(2));
-        assert!(row.get::<_, bool>(3));
+        );
+        let schedule = available_at(&client, submitted.id).await;
 
-        let producer = Producer::new(&client, &name, "1").delay(Duration::from_secs(600));
-        let duplicate = match subject {
-            None => producer.submit(key, &json!({})).await,
-            Some(subject) => producer.submit_for(subject, key, &json!({})).await,
-        }
-        .unwrap();
+        let duplicate = submit_as(&delayed(600), subject, key).await;
         assert_eq!(duplicate.id, submitted.id);
         assert!(!duplicate.created);
-        assert_eq!(
-            client
-                .query_one(
-                    "select available_at::text from resume.runs where id = $1",
-                    &[&submitted.id],
-                )
-                .await
-                .unwrap()
-                .get::<_, String>(0),
-            schedule
-        );
-        assert!(
-            competitor
-                .query_opt("select id from resume.claim_run($1, '1', 60)", &[&name],)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert_eq!(available_at(&client, submitted.id).await, schedule);
+        assert!(claim(&competitor, &name).await.is_none());
 
         // A future run does not prevent a later, immediately eligible run from being claimed.
         let immediate = Producer::new(&client, &name, "1")
             .submit(&format!("immediate-{key}"), &json!({}))
             .await
             .unwrap();
-        let claimed = competitor
-            .query_one(
-                "select id, attempt from resume.claim_run($1, '1', 60)",
-                &[&name],
-            )
-            .await
-            .unwrap();
-        assert_eq!(claimed.get::<_, i64>(0), immediate.id);
-        competitor
-            .execute(
-                "select resume.complete_run($1, $2)",
-                &[&immediate.id, &claimed.get::<_, i64>(1)],
-            )
-            .await
-            .unwrap();
+        let (id, attempt) = claim(&competitor, &name).await.unwrap();
+        assert_eq!(id, immediate.id);
+        complete(&competitor, id, attempt).await.unwrap();
 
         // Advance eligibility instead of sleeping five minutes, then race two claimers.
-        client
-            .execute(
-                "update resume.runs set available_at = clock_timestamp() - interval '1 second'
-             where id = $1",
-                &[&submitted.id],
-            )
-            .await
-            .unwrap();
-        let (a, b) = tokio::join!(
-            async {
-                client
-                    .query_opt(
-                        "select id, attempt from resume.claim_run($1, '1', 60)",
-                        &[&name],
-                    )
-                    .await
-            },
-            async {
-                competitor
-                    .query_opt(
-                        "select id, attempt from resume.claim_run($1, '1', 60)",
-                        &[&name],
-                    )
-                    .await
-            },
+        make_due(&client, submitted.id).await;
+        let (a, b) = tokio::join!(claim(&client, &name), claim(&competitor, &name));
+        let claims: Vec<_> = [a, b].into_iter().flatten().collect();
+        assert_eq!(
+            claims,
+            [(submitted.id, 1)],
+            "two claimers won, or waiting used up an attempt"
         );
-        let claims: Vec<_> = [a.unwrap(), b.unwrap()].into_iter().flatten().collect();
-        assert_eq!(claims.len(), 1);
-        assert_eq!(claims[0].get::<_, i64>(0), submitted.id);
-        assert_eq!(claims[0].get::<_, i64>(1), 1, "waiting used up an attempt");
-        client
-            .execute("select resume.complete_run($1, 1)", &[&submitted.id])
-            .await
-            .unwrap();
+        complete(&client, submitted.id, 1).await.unwrap();
     }
 }
 
@@ -144,43 +98,18 @@ pub(super) async fn earlier_deadline_fails_a_scheduled_run_without_claiming_it()
         .await
         .unwrap()
         .id;
+    assert!(run_is(&client, run, "available_at = deadline_at").await);
+    pass_deadline(&client, run).await;
+    assert!(claim(&client, &name).await.is_none());
     assert!(
-        client
-            .query_one(
-                "select available_at = deadline_at from resume.runs where id = $1",
-                &[&run],
-            )
-            .await
-            .unwrap()
-            .get::<_, bool>(0)
-    );
-    client
-        .execute(
-            "update resume.runs
-         set deadline_at = clock_timestamp() - interval '1 second',
-             available_at = clock_timestamp() - interval '1 second'
-         where id = $1",
-            &[&run],
+        run_is(
+            &client,
+            run,
+            "attempt = 0 and failed_at is not null
+             and last_error = 'the run passed its deadline'"
         )
         .await
-        .unwrap();
-    assert!(
-        client
-            .query_opt("select id from resume.claim_run($1, '1', 60)", &[&name],)
-            .await
-            .unwrap()
-            .is_none()
     );
-    let row = client
-        .query_one(
-            "select attempt, failed_at is not null, last_error from resume.runs where id = $1",
-            &[&run],
-        )
-        .await
-        .unwrap();
-    assert_eq!(row.get::<_, i64>(0), 0);
-    assert!(row.get::<_, bool>(1));
-    assert_eq!(row.get::<_, String>(2), "the run passed its deadline");
 }
 
 pub(super) async fn submission_rejects_invalid_schedules_and_zero_is_immediately_eligible() {
@@ -217,17 +146,15 @@ pub(super) async fn submission_rejects_invalid_schedules_and_zero_is_immediately
             .unwrap_err();
         assert_eq!(error.as_db_error().unwrap().code().code(), "22023");
     }
-    assert_eq!(
-        client
-            .query_one(
-                "select count(*) from resume.runs where workflow = $1",
-                &[&name],
-            )
-            .await
-            .unwrap()
-            .get::<_, i64>(0),
-        0
-    );
+    let runs: i64 = client
+        .query_one(
+            "select count(*) from resume.runs where workflow = $1",
+            &[&name],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(runs, 0, "an invalid submission created a run");
 
     let run: i64 = client
         .query_one(
@@ -237,24 +164,13 @@ pub(super) async fn submission_rejects_invalid_schedules_and_zero_is_immediately
         .await
         .unwrap()
         .get(0);
-    assert_eq!(
-        client
-            .query_one("select id from resume.claim_run($1, '1', 60)", &[&name],)
-            .await
-            .unwrap()
-            .get::<_, i64>(0),
-        run
-    );
+    assert_eq!(claim(&client, &name).await.unwrap().0, run);
 }
 
 pub(super) async fn absolute_times_preserve_offsets_and_duplicate_submissions_keep_the_schedule() {
     let client = connect().await;
     let name = workflow("absolute");
-    let future: SystemTime = client
-        .query_one("select clock_timestamp() + interval '2 hours'", &[])
-        .await
-        .unwrap()
-        .get(0);
+    let future = in_two_hours(&client).await;
     let utc: DateTime<Utc> = future.into();
     let timestamps = [
         utc.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
@@ -273,70 +189,38 @@ pub(super) async fn absolute_times_preserve_offsets_and_duplicate_submissions_ke
         let subject = (index == 1).then_some("customer:42");
         let producer = Producer::new(&client, &name, "1")
             .delay(Duration::from_secs(86400))
-            .at(timestamp.parse().unwrap());
-        let submitted = match subject {
-            Some(subject) => producer.submit_for(subject, &key, &json!({})).await,
-            None => producer.submit(&key, &json!({})).await,
-        }
-        .unwrap();
-        let row = client
-            .query_one(
-                "select available_at, attempt, leased from resume.runs where id = $1",
-                &[&submitted.id],
-            )
-            .await
-            .unwrap();
-        assert_eq!(row.get::<_, SystemTime>(0), future);
-        assert_eq!(row.get::<_, i64>(1), 0);
-        assert!(!row.get::<_, bool>(2));
-        assert!(
-            client
-                .query_opt("select id from resume.claim_run($1, '1', 60)", &[&name],)
-                .await
-                .unwrap()
-                .is_none()
-        );
+            .at(timestamp.parse::<DateTime<Utc>>().unwrap());
+        let submitted = submit_as(&producer, subject, &key).await;
+        assert_eq!(available_at(&client, submitted.id).await, future);
+        assert!(run_is(&client, submitted.id, "attempt = 0 and not leased").await);
+        assert!(claim(&client, &name).await.is_none());
 
-        let producer =
-            Producer::new(&client, &name, "1").at((future + Duration::from_secs(3600)).into());
-        let duplicate = match subject {
-            Some(subject) => producer.submit_for(subject, &key, &json!({})).await,
-            None => producer.submit(&key, &json!({})).await,
-        }
-        .unwrap();
+        let later = Producer::new(&client, &name, "1").at(future + Duration::from_secs(3600));
+        let duplicate = submit_as(&later, subject, &key).await;
         assert_eq!(duplicate.id, submitted.id);
         assert!(!duplicate.created);
-        assert_eq!(
-            client
-                .query_one(
-                    "select available_at from resume.runs where id = $1",
-                    &[&submitted.id],
-                )
-                .await
-                .unwrap()
-                .get::<_, SystemTime>(0),
-            future
-        );
+        assert_eq!(available_at(&client, submitted.id).await, future);
     }
 }
 
 pub(super) async fn past_times_are_eligible_and_the_last_schedule_setter_wins() {
     let client = connect().await;
     let name = workflow("past");
+    let producer = || Producer::new(&client, &name, "1");
     let past = "2000-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
-    let immediate = Producer::new(&client, &name, "1")
+    let immediate = producer()
         .delay(Duration::from_secs(300))
         .at(past)
         .submit("past", &json!({}))
         .await
         .unwrap();
-    let cleared = Producer::new(&client, &name, "1")
-        .at("2099-01-01T00:00:00Z".parse().unwrap())
+    let cleared = producer()
+        .at("2099-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap())
         .delay(Duration::ZERO)
         .submit("zero", &json!({}))
         .await
         .unwrap();
-    let future = Producer::new(&client, &name, "1")
+    let future = producer()
         .at(past)
         .delay(Duration::from_secs(300))
         .submit("future", &json!({}))
@@ -344,83 +228,32 @@ pub(super) async fn past_times_are_eligible_and_the_last_schedule_setter_wins() 
         .unwrap();
 
     for run in [immediate.id, cleared.id] {
-        let claimed = client
-            .query_one(
-                "select id, attempt from resume.claim_run($1, '1', 60)",
-                &[&name],
-            )
-            .await
-            .unwrap();
-        assert_eq!(claimed.get::<_, i64>(0), run);
-        assert_eq!(claimed.get::<_, i64>(1), 1);
-        client
-            .execute("select resume.complete_run($1, 1)", &[&run])
-            .await
-            .unwrap();
+        assert_eq!(claim(&client, &name).await, Some((run, 1)));
+        complete(&client, run, 1).await.unwrap();
     }
+    assert!(claim(&client, &name).await.is_none());
     assert!(
-        client
-            .query_opt("select id from resume.claim_run($1, '1', 60)", &[&name],)
-            .await
-            .unwrap()
-            .is_none()
+        run_is(
+            &client,
+            future.id,
+            "attempt = 0 and available_at > clock_timestamp()"
+        )
+        .await
     );
-    assert!(client.query_one(
-        "select attempt = 0 and available_at > clock_timestamp() from resume.runs where id = $1",
-        &[&future.id],
-    ).await.unwrap().get::<_, bool>(0));
 }
 
 pub(super) async fn an_absolute_schedule_cannot_postpone_the_deadline() {
     let client = connect().await;
     let name = workflow("absolute-deadline");
-    let future: SystemTime = client
-        .query_one("select clock_timestamp() + interval '2 hours'", &[])
-        .await
-        .unwrap()
-        .get(0);
     let run = Producer::new(&client, &name, "1")
-        .at(future.into())
+        .at(in_two_hours(&client).await)
         .deadline(Duration::from_secs(3600))
         .submit("key", &json!({}))
         .await
         .unwrap()
         .id;
-    assert!(
-        client
-            .query_one(
-                "select available_at = deadline_at from resume.runs where id = $1",
-                &[&run],
-            )
-            .await
-            .unwrap()
-            .get::<_, bool>(0)
-    );
-    client
-        .execute(
-            "update resume.runs
-         set deadline_at = clock_timestamp() - interval '1 second',
-             available_at = clock_timestamp() - interval '1 second'
-         where id = $1",
-            &[&run],
-        )
-        .await
-        .unwrap();
-    assert!(
-        client
-            .query_opt("select id from resume.claim_run($1, '1', 60)", &[&name],)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        client
-            .query_one(
-                "select attempt = 0 and failed_at is not null from resume.runs where id = $1",
-                &[&run],
-            )
-            .await
-            .unwrap()
-            .get::<_, bool>(0)
-    );
+    assert!(run_is(&client, run, "available_at = deadline_at").await);
+    pass_deadline(&client, run).await;
+    assert!(claim(&client, &name).await.is_none());
+    assert!(run_is(&client, run, "attempt = 0 and failed_at is not null").await);
 }

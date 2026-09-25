@@ -4,16 +4,13 @@
 eligibility time ten seconds ahead. Workers exclude it from claims until then. Once claimed,
 a regular step delivers the reminder to a local database inbox.
 
-With the current core schema installed, run from the repository root:
+After `just reset`, which installs every schema, run from the repository root:
 
 ```sh
-just reminders-schema
 just reminders-submit later 10 "Time to stretch"
 just reminders-submit now 0 "This one is ready immediately"
 just reminders-process
 ```
-
-`just reset` includes this example's schema, so omit `reminders-schema` if you used it.
 
 `now` is delivered first. In another terminal, `just reminders-show` shows `later` waiting
 with zero claims until its scheduled time. No step is running during that wait.

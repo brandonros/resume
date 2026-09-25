@@ -79,12 +79,12 @@ dependencies = [
 name = "checkout"
 version = "0.1.0"
 dependencies = [
+ "harness",
  "resume",
  "serde_json",
  "tokio",
  "tokio-postgres",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -92,6 +92,7 @@ name = "checks"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "harness",
  "resume",
  "serde_json",
  "tokio",
@@ -123,12 +124,12 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 name = "counter"
 version = "0.1.0"
 dependencies = [
+ "harness",
  "resume",
  "serde_json",
  "tokio",
  "tokio-postgres",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -184,12 +185,12 @@ dependencies = [
 name = "exports"
 version = "0.1.0"
 dependencies = [
+ "harness",
  "resume",
  "serde_json",
  "tokio",
  "tokio-postgres",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -258,6 +259,8 @@ dependencies = [
  "resume",
  "tokio",
  "tokio-postgres",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -395,7 +398,6 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -508,7 +510,6 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -556,19 +557,19 @@ dependencies = [
 name = "reminders"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "harness",
  "resume",
  "serde_json",
  "tokio",
  "tokio-postgres",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
 name = "resume"
 version = "0.1.0"
 dependencies = [
- "chrono",
  "serde_json",
  "tokio",
  "tokio-postgres",
@@ -659,7 +660,6 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -721,7 +721,6 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -748,12 +747,12 @@ dependencies = [
 name = "tickets"
 version = "0.1.0"
 dependencies = [
+ "harness",
  "resume",
  "serde_json",
  "tokio",
  "tokio-postgres",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

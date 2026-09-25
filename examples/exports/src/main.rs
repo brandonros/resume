@@ -5,18 +5,17 @@ use std::time::Duration;
 use mock_vendor::MockVendor;
 use resume::{Permanent, Producer, Result, RetryPolicy, Run, Snooze, Worker, shutdown_signal};
 use serde_json::json;
-use tokio_postgres::{Client, NoTls};
 
 const VERSION: &str = "1";
 const CHECK_AGAIN: Duration = Duration::from_secs(2);
 
-async fn export(client: &mut Client, run: &Run, vendor: &MockVendor) -> Result<()> {
+async fn export(run: &Run, vendor: &MockVendor) -> Result<()> {
     let ready_after = run.input["ready_after_seconds"]
         .as_u64()
         .ok_or_else(|| Permanent("ready_after_seconds must be a nonnegative integer".into()))?;
 
     let started = run
-        .step(client, "start_export", async |_| {
+        .step("start_export", async |_| {
             let export_id = vendor
                 .start(&run.idempotency_key, Duration::from_secs(ready_after))
                 .await?;
@@ -27,7 +26,7 @@ async fn export(client: &mut Client, run: &Run, vendor: &MockVendor) -> Result<(
     let export_id = started["export_id"].as_i64().ok_or("missing export ID")?;
 
     let finished = run
-        .step(client, "wait_for_export", async |_| {
+        .step("wait_for_export", async |_| {
             let Some(url) = vendor.download_url(export_id).await? else {
                 tracing::info!(export_id, "still processing; check again in 2 seconds");
                 // The step stays unfinished. The worker releases this run and handles other work.
@@ -38,7 +37,7 @@ async fn export(client: &mut Client, run: &Run, vendor: &MockVendor) -> Result<(
         .await?;
     let url = finished["url"].as_str().ok_or("missing export URL")?;
 
-    run.step(client, "record_export", async |tx| {
+    run.step("record_export", async |tx| {
         tx.execute(
             "insert into exports.results (run_id, export_id, url) values ($1, $2, $3)",
             &[&run.id, &export_id, &url],
@@ -51,25 +50,9 @@ async fn export(client: &mut Client, run: &Run, vendor: &MockVendor) -> Result<(
     Ok(())
 }
 
-async fn connect(database_url: &str) -> Result<Client> {
-    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(error) = connection.await {
-            tracing::error!("postgres: {error}");
-        }
-    });
-    Ok(client)
-}
-
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .init();
-
-    let database_url = std::env::var("DATABASE_URL")?;
-    let client = connect(&database_url).await?;
+    let (database_url, client) = harness::start().await?;
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("submit") => {
@@ -95,11 +78,9 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some("work") | None => {
-            let vendor = MockVendor::new(connect(&database_url).await?);
+            let vendor = MockVendor::new(harness::connect(&database_url).await?);
             Worker::new(client, "exports", VERSION)
-                .run(shutdown_signal(), async |client, run| {
-                    export(client, run, &vendor).await
-                })
+                .run(shutdown_signal(), async |run| export(run, &vendor).await)
                 .await
         }
         _ => Err("expected submit <key> [ready_after_seconds] or work".into()),

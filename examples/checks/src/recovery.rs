@@ -4,21 +4,16 @@ use std::time::Duration;
 use resume::{Producer, RetryPolicy, Worker};
 use serde_json::json;
 use tokio::sync::oneshot;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 
-async fn connect() -> Client {
-    let (client, connection) = tokio_postgres::connect(
-        &std::env::var("DATABASE_URL").expect("run with just check"),
-        NoTls,
-    )
-    .await
-    .unwrap();
-    tokio::spawn(connection);
-    client
-}
+use crate::common::{
+    claim, claim_with, complete, connect, end_attempt, make_due, pass_deadline, run_is, workflow,
+};
 
+/// Submits a run with this many attempts and a failure handler, `<workflow>-handler` version 2.
+/// Returns the run's ID and its workflow.
 async fn submit(client: &Client, tag: &str, attempts: i32) -> (i64, String) {
-    let workflow = format!("failure-{tag}-{}", std::process::id());
+    let workflow = workflow(&format!("failure-{tag}"));
     let run = Producer::new(client, &workflow, "1")
         .retry(RetryPolicy {
             max_attempts: attempts,
@@ -32,98 +27,92 @@ async fn submit(client: &Client, tag: &str, attempts: i32) -> (i64, String) {
     (run, workflow)
 }
 
-async fn claim(client: &Client, workflow: &str, version: &str) -> (i64, i64) {
-    let row = client
-        .query_one(
-            "select id, attempt from resume.claim_run($1, $2, 60)",
-            &[&workflow, &version],
-        )
+/// Claims the next run of the workflow's handler.
+async fn claim_handler(client: &Client, workflow: &str) -> (i64, i64) {
+    claim_with(client, &format!("{workflow}-handler"), "2", 60.0)
         .await
-        .unwrap();
-    (row.get(0), row.get(1))
+        .unwrap()
 }
 
 async fn handlers(client: &Client, run: i64) -> i64 {
-    client.query_one("select count(*) from resume.runs where idempotency_key = 'resume:on_failure:' || $1::bigint::text", &[&run])
-        .await.unwrap().get(0)
+    client
+        .query_one(
+            "select count(*) from resume.runs
+             where idempotency_key = 'resume:on_failure:' || $1::bigint::text",
+            &[&run],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
+async fn cancel(client: &Client, run: i64) {
+    client
+        .execute("select resume.cancel_run($1)", &[&run])
+        .await
+        .unwrap();
+}
+
+async fn reopen(client: &Client, run: i64) -> Result<u64, tokio_postgres::Error> {
+    client
+        .execute("select resume.reopen_run($1)", &[&run])
+        .await
 }
 
 pub(super) async fn failure_and_handler_commit_together() {
     let mut client = connect().await;
     let observer = connect().await;
     let (run, workflow) = submit(&client, "atomic", 1).await;
-    let (_, attempt) = claim(&client, &workflow, "1").await;
+    let (_, attempt) = claim(&client, &workflow).await.unwrap();
     let tx = client.transaction().await.unwrap();
     tx.execute(
-        "select resume.fail_run($1, $2, 'rejected')",
+        "select resume.end_attempt($1, $2, 'rejected', true)",
         &[&run, &attempt],
     )
     .await
     .unwrap();
     assert_eq!(handlers(&observer, run).await, 0);
-    assert!(
-        observer
-            .query_one(
-                "select failed_at is null from resume.runs where id=$1",
-                &[&run]
-            )
-            .await
-            .unwrap()
-            .get::<_, bool>(0)
-    );
+    assert!(run_is(&observer, run, "failed_at is null").await);
     tx.rollback().await.unwrap();
     assert_eq!(handlers(&client, run).await, 0);
-    client
-        .execute(
-            "select resume.fail_run($1, $2, 'rejected')",
-            &[&run, &attempt],
-        )
+
+    end_attempt(&client, run, attempt, "rejected", true)
         .await
         .unwrap();
     assert!(
-        client
-            .execute(
-                "select resume.fail_run($1, $2, 'rejected')",
-                &[&run, &attempt]
-            )
+        end_attempt(&client, run, attempt, "rejected", true)
             .await
             .is_err()
     );
     client
         .execute(
-            "update resume.runs set failed_at = failed_at where id=$1",
+            "update resume.runs set failed_at = failed_at where id = $1",
             &[&run],
         )
         .await
         .unwrap();
     assert_eq!(handlers(&client, run).await, 1);
-    let handler = format!("{workflow}-handler");
+
+    // Only workers of the handler's version claim it.
     assert!(
-        client
-            .query_opt("select id from resume.claim_run($1, '1', 60)", &[&handler])
+        claim(&client, &format!("{workflow}-handler"))
             .await
-            .unwrap()
             .is_none()
     );
-    let (id, _) = claim(&client, &handler, "2").await;
+    let (id, _) = claim_handler(&client, &workflow).await;
     let row = client
         .query_one(
-            "select input, max_attempts from resume.runs where id=$1",
+            "select input, max_attempts from resume.runs where id = $1",
             &[&id],
         )
         .await
         .unwrap();
     assert_eq!(
         row.get::<_, serde_json::Value>(0),
-        json!({"failed_run":run, "error":"rejected", "input":{"order":42}})
+        json!({"failed_run": run, "error": "rejected", "input": {"order": 42}})
     );
     assert_eq!(row.get::<_, i32>(1), 3);
-    assert!(
-        client
-            .execute("select resume.reopen_run($1)", &[&run])
-            .await
-            .is_err()
-    );
+    assert!(reopen(&client, run).await.is_err());
 }
 
 pub(super) async fn every_terminal_path_queues_the_handler() {
@@ -131,27 +120,14 @@ pub(super) async fn every_terminal_path_queues_the_handler() {
     for path in ["cancel", "deadline", "lease"] {
         let (run, workflow) = submit(&client, path, 1).await;
         match path {
-            "cancel" => {
-                client
-                    .execute("select resume.cancel_run($1)", &[&run])
-                    .await
-                    .unwrap();
-            }
-            "deadline" => {
-                client.execute("update resume.runs set deadline_at=clock_timestamp()-interval '1 second' where id=$1", &[&run]).await.unwrap();
-            }
+            "cancel" => cancel(&client, run).await,
+            "deadline" => pass_deadline(&client, run).await,
             _ => {
-                claim(&client, &workflow, "1").await;
-                client.execute("update resume.runs set available_at=clock_timestamp()-interval '1 second' where id=$1", &[&run]).await.unwrap();
+                claim(&client, &workflow).await.unwrap();
+                make_due(&client, run).await;
             }
         }
-        assert!(
-            client
-                .query_opt("select id from resume.claim_run($1, '1', 60)", &[&workflow])
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(claim(&client, &workflow).await.is_none());
         assert_eq!(handlers(&client, run).await, 1, "{path} lost the handler");
     }
 }
@@ -159,45 +135,28 @@ pub(super) async fn every_terminal_path_queues_the_handler() {
 pub(super) async fn success_retry_and_snooze_do_not_queue_handlers() {
     let client = connect().await;
     let (run, workflow) = submit(&client, "success", 3).await;
-    let (_, first) = claim(&client, &workflow, "1").await;
-    client
-        .execute(
-            "select resume.retry_run($1, $2, 'temporary')",
-            &[&run, &first],
-        )
+    let (_, first) = claim(&client, &workflow).await.unwrap();
+    end_attempt(&client, run, first, "temporary", false)
         .await
         .unwrap();
     assert_eq!(handlers(&client, run).await, 0);
-    client
-        .execute(
-            "update resume.runs set available_at=clock_timestamp() where id=$1",
-            &[&run],
-        )
-        .await
-        .unwrap();
-    let (_, second) = claim(&client, &workflow, "1").await;
+    make_due(&client, run).await;
+    let (_, second) = claim(&client, &workflow).await.unwrap();
     client
         .execute("select resume.release_run($1, $2, 0)", &[&run, &second])
         .await
         .unwrap();
     assert_eq!(handlers(&client, run).await, 0);
-    let (_, third) = claim(&client, &workflow, "1").await;
-    client
-        .execute("select resume.complete_run($1, $2)", &[&run, &third])
-        .await
-        .unwrap();
+    let (_, third) = claim(&client, &workflow).await.unwrap();
+    complete(&client, run, third).await.unwrap();
     assert_eq!(handlers(&client, run).await, 0);
 }
 
 pub(super) async fn failed_handler_reopens_with_saved_progress() {
     let client = connect().await;
     let (run, workflow) = submit(&client, "reopen", 1).await;
-    client
-        .execute("select resume.cancel_run($1)", &[&run])
-        .await
-        .unwrap();
-    let handler = format!("{workflow}-handler");
-    let (id, attempt) = claim(&client, &handler, "2").await;
+    cancel(&client, run).await;
+    let (id, attempt) = claim_handler(&client, &workflow).await;
     client
         .execute(
             "select resume.begin_step($1, $2, 'release', 0, 60)",
@@ -207,24 +166,18 @@ pub(super) async fn failed_handler_reopens_with_saved_progress() {
         .unwrap();
     client
         .execute(
-            "select resume.save_step($1, $2, 'release', 'true', null)",
+            "select resume.save_step($1, $2, 'release', 'true')",
             &[&id, &attempt],
         )
         .await
         .unwrap();
-    client
-        .execute(
-            "select resume.fail_run($1, $2, 'refund unavailable')",
-            &[&id, &attempt],
-        )
+    end_attempt(&client, id, attempt, "refund unavailable", true)
         .await
         .unwrap();
     assert_eq!(handlers(&client, id).await, 0);
-    client
-        .execute("select resume.reopen_run($1)", &[&id])
-        .await
-        .unwrap();
-    let (_, next) = claim(&client, &handler, "2").await;
+    reopen(&client, id).await.unwrap();
+
+    let (_, next) = claim_handler(&client, &workflow).await;
     let saved = client
         .query_one(
             "select output from resume.begin_step($1, $2, 'release', 0, 60)",
@@ -233,22 +186,31 @@ pub(super) async fn failed_handler_reopens_with_saved_progress() {
         .await
         .unwrap();
     assert_eq!(saved.get::<_, serde_json::Value>(0), json!(true));
-    client
-        .execute("select resume.complete_run($1, $2)", &[&id, &next])
-        .await
-        .unwrap();
+    complete(&client, id, next).await.unwrap();
     assert_eq!(handlers(&client, run).await, 1);
-    assert!(
-        client
-            .execute("select resume.reopen_run($1)", &[&run])
-            .await
-            .is_err()
-    );
+    assert!(reopen(&client, run).await.is_err());
+}
+
+pub(super) async fn reserved_handler_keys_cannot_be_submitted() {
+    let client = connect().await;
+    let (run, workflow) = submit(&client, "reserved", 1).await;
+    // Taking the key the handler will use would make the run's failure roll back.
+    let error = Producer::new(&client, format!("{workflow}-handler"), "2")
+        .submit(&format!("resume:on_failure:{run}"), &json!({}))
+        .await
+        .err()
+        .expect("submitted a reserved key");
+    let code = error
+        .downcast_ref::<tokio_postgres::Error>()
+        .and_then(tokio_postgres::Error::code)
+        .map(|code| code.code().to_string());
+    assert_eq!(code.as_deref(), Some("22023"));
+    cancel(&client, run).await;
+    assert_eq!(handlers(&client, run).await, 1);
 }
 
 pub(super) async fn worker_exhaustion_queues_handler_without_step_output() {
     let client = connect().await;
-    let worker_client = connect().await;
     let vendor = connect().await;
     vendor
         .batch_execute("create table resume.check_vendor_effects (run_id bigint primary key)")
@@ -256,14 +218,14 @@ pub(super) async fn worker_exhaustion_queues_handler_without_step_output() {
         .unwrap();
     let (id, workflow) = submit(&client, "worker", 1).await;
     let (stop, shutdown) = oneshot::channel();
-    let worker = Worker::new(worker_client, &workflow, "1")
+    let worker = Worker::new(connect().await, &workflow, "1")
         .poll_interval(Duration::from_millis(10))
         .run(
             async {
                 let _ = shutdown.await;
             },
-            async |client, run| {
-                run.step(client, "charge", async |_| {
+            async |run| {
+                run.step("charge", async |_| {
                     vendor
                         .execute(
                             "insert into resume.check_vendor_effects values ($1)",
@@ -285,24 +247,14 @@ pub(super) async fn worker_exhaustion_queues_handler_without_step_output() {
         .await
         .unwrap();
         assert_eq!(handlers(&client, id).await, 1);
-        assert_eq!(
-            client
-                .query_one("select count(*) from resume.steps where run_id=$1", &[&id])
-                .await
-                .unwrap()
-                .get::<_, i64>(0),
-            0
-        );
-        assert_eq!(
-            client
-                .query_one(
-                    "select count(*) from resume.check_vendor_effects where run_id=$1",
-                    &[&id]
-                )
-                .await
-                .unwrap()
-                .get::<_, i64>(0),
-            1
+        assert!(
+            run_is(
+                &client,
+                id,
+                "not exists (select 1 from resume.steps s where s.run_id = runs.id)
+                 and (select count(*) from resume.check_vendor_effects v where v.run_id = runs.id) = 1"
+            )
+            .await
         );
         stop.send(()).unwrap();
     };
