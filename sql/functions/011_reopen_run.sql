@@ -19,7 +19,7 @@ begin
             p_run_id using errcode = '55000';
     end if;
 
-    select idempotency_key into v_step from resume.steps
+    select key into v_step from resume.steps
     where run_id = p_run_id and completed_at is null;
     if found then
         raise exception 'run % step % has an unknown outcome; resolve it with resolve_step',

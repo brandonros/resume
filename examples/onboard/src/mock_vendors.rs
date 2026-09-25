@@ -228,10 +228,7 @@ impl Vendors {
     }
 
     async fn before(&mut self, call: &str) -> Result<()> {
-        if self.faults.latency_ms > 0 {
-            let ms = self.faults.rng.below(self.faults.latency_ms + 1);
-            tokio::time::sleep(Duration::from_millis(ms)).await;
-        }
+        self.faults.rng.pause(self.faults.latency_ms).await;
         if self.faults.fires(call, "error") {
             tracing::warn!("fault {call}.error: failing before the vendor does anything");
             return Err(format!("{call}: 503 service unavailable").into());

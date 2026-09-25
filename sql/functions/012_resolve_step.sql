@@ -3,7 +3,7 @@
 -- output is what the action would have returned, such as the vendor's ID for what it created.
 create or replace function resume.resolve_step(
     p_run_id bigint,
-    p_idempotency_key text,
+    p_key text,
     p_output jsonb
 )
 returns void
@@ -17,9 +17,9 @@ begin
 
     update resume.steps
     set completed_at = clock_timestamp(), output = p_output
-    where run_id = p_run_id and idempotency_key = p_idempotency_key and completed_at is null;
+    where run_id = p_run_id and key = p_key and completed_at is null;
     if not found then
-        raise exception 'run % has no unresolved step %', p_run_id, p_idempotency_key
+        raise exception 'run % has no unresolved step %', p_run_id, p_key
             using errcode = '55000';
     end if;
 

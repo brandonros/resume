@@ -7,7 +7,7 @@ just check
 ```
 
 This creates a temporary PostgreSQL database, installs the framework schema, runs all
-21 scenarios, and drops the database on exit. An assertion failure or timeout makes
+23 scenarios, and drops the database on exit. An assertion failure or timeout makes
 the command fail. It does not touch your application database.
 
 The scenarios cover:

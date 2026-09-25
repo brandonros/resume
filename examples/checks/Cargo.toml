@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+harness = { path = "../harness" }
 resume = { path = "../../crates/resume" }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 serde_json.workspace = true

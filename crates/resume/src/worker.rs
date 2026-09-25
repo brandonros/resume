@@ -8,13 +8,15 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio_postgres::{Client, GenericClient, Transaction};
+use tokio::sync::{Mutex, MutexGuard};
+use tokio_postgres::{Client, Transaction};
 use tracing::Instrument;
 
-use crate::{Check, Permanent, Result, RunFailed, Snooze};
+use crate::{Permanent, Result, Snooze};
 
 pub struct Worker {
-    client: Client,
+    /// Shared with the claimed run, which uses it for its steps.
+    client: Arc<Mutex<Client>>,
     workflow: String,
     version: String,
     lease: Duration,
@@ -29,7 +31,7 @@ impl Worker {
     /// Defaults to a 60 second lease and a 30 second step timeout.
     pub fn new(client: Client, workflow: impl Into<String>, version: impl Into<String>) -> Self {
         Self {
-            client,
+            client: Arc::new(Mutex::new(client)),
             workflow: workflow.into(),
             version: version.into(),
             lease: Duration::from_secs(60),
@@ -45,8 +47,9 @@ impl Worker {
         self
     }
 
-    /// How long one step's action may take. It must be shorter than the lease, leaving time
-    /// to save the result.
+    /// How long one step's action may take. It covers only the action, not starting, saving
+    /// or committing the step, which the lease bounds through Postgres's statement timeout. It
+    /// must be shorter than the lease, leaving time to save the result.
     pub fn step_timeout(mut self, step_timeout: Duration) -> Self {
         self.step_timeout = step_timeout;
         self
@@ -63,9 +66,9 @@ impl Worker {
     /// Claims and executes runs until `shutdown` resolves. The run in progress then finishes
     /// its current step and is released, so another worker continues it at once.
     pub async fn run(
-        mut self,
+        self,
         shutdown: impl Future<Output = ()>,
-        mut execute: impl AsyncFnMut(&mut Client, &Run) -> Result<()>,
+        mut execute: impl AsyncFnMut(&Run) -> Result<()>,
     ) -> Result<()> {
         if self.step_timeout >= self.lease {
             return Err("step timeout must be shorter than the lease".into());
@@ -78,6 +81,8 @@ impl Worker {
         // closes. A healthy step finishes within the lease, since the step timeout is shorter.
         let lease_ms = self.lease.as_millis();
         self.client
+            .lock()
+            .await
             .batch_execute(&format!(
                 "set idle_in_transaction_session_timeout = {lease_ms};
                  set statement_timeout = {lease_ms};
@@ -127,8 +132,8 @@ impl Worker {
             let result = {
                 let mut work = pin!(
                     async {
-                        execute(&mut self.client, &run).await?;
-                        run.complete_run(&self.client).await
+                        execute(&run).await?;
+                        run.complete_run().await
                     }
                     .instrument(span.clone())
                 );
@@ -145,7 +150,7 @@ impl Worker {
                     }
                 }
             };
-            self.settle(&run, result).instrument(span).await;
+            run.settle(result).instrument(span).await;
         }
         tracing::info!("{workflow}: worker stopped");
         Ok(())
@@ -155,6 +160,8 @@ impl Worker {
     async fn claim_run(&self, stopping: &Arc<AtomicBool>) -> Result<Option<(Run, bool)>> {
         let row = self
             .client
+            .lock()
+            .await
             .query_opt(
                 "select id, idempotency_key, input, attempt, released, max_attempts, expired
                  from resume.claim_run($1, $2, $3)",
@@ -174,64 +181,11 @@ impl Worker {
                 step_timeout: self.step_timeout,
                 stopping: stopping.clone(),
                 position: AtomicI32::new(0),
+                client: self.client.clone(),
             };
             Ok((run, row.try_get("expired")?))
         })
         .transpose()
-    }
-
-    /// Records how the attempt ended: a retryable error schedules a retry after a backoff,
-    /// a permanent one fails the run, and a snoozing or stopping worker releases it.
-    async fn settle(&self, run: &Run, result: Result<()>) {
-        let error = match result {
-            Ok(()) => {
-                tracing::info!("completed");
-                return;
-            }
-            Err(error) => error,
-        };
-
-        if error.is::<Stopping>() {
-            match run.release_run(&self.client, Duration::ZERO).await {
-                Ok(()) => tracing::info!("released for another worker"),
-                Err(e) => {
-                    tracing::warn!("could not release ({e}); it continues after its lease expires")
-                }
-            }
-            return;
-        }
-
-        if let Some(Snooze(delay)) = error.downcast_ref::<Snooze>() {
-            match run.release_run(&self.client, *delay).await {
-                Ok(()) => tracing::info!("snoozed for {delay:?} (bounded by the run's deadline)"),
-                Err(e) => {
-                    tracing::warn!("could not snooze ({e}); it continues after its lease expires")
-                }
-            }
-            return;
-        }
-
-        let next = if error.is::<RunFailed>() {
-            Ok("run failed".to_string())
-        } else if error.is::<Permanent>() {
-            run.fail_run(&self.client, &error.to_string())
-                .await
-                .map(|()| "permanent; run failed".to_string())
-        } else if run.number() >= i64::from(run.max_attempts) {
-            run.fail_run(&self.client, &error.to_string())
-                .await
-                .map(|()| "attempt limit reached; run failed".to_string())
-        } else {
-            run.retry_run(&self.client, &error.to_string())
-                .await
-                .map(|seconds| format!("retry in {seconds:.1}s"))
-        };
-        match next {
-            Ok(next) => tracing::warn!("failed: {error}; {next}"),
-            Err(e) => tracing::warn!(
-                "failed: {error}; could not record it ({e}), so it retries after the lease expires"
-            ),
-        }
     }
 }
 
@@ -276,150 +230,42 @@ pub struct Run {
     stopping: Arc<AtomicBool>,
     /// The position the next step will have in this attempt.
     position: AtomicI32,
+    client: Arc<Mutex<Client>>,
 }
 
 impl Run {
     /// Use a key that is unique within the run and stable across attempts; it may be dynamic.
     /// Use the supplied transaction for the step's database effects.
     /// Those effects and the saved result commit together. External effects may repeat.
+    ///
+    /// To make sure an external effect exists without repeating it, look for it first and
+    /// create it only if missing: a retry after a crash then finds it. To act only while the
+    /// current state allows, check and act in the same step, locking what the check reads
+    /// (`select ... for update` for rows, `lock_resource` for anything else); to skip, return
+    /// an output that says so.
     pub async fn step(
         &self,
-        client: &mut Client,
-        idempotency_key: &str,
+        key: &str,
         action: impl AsyncFnOnce(&Transaction<'_>) -> Result<Value>,
     ) -> Result<Value> {
         async {
-            let (tx, existing, _, _) = self.begin_step(client, idempotency_key).await?;
-            if let Some(output) = existing {
+            let mut client = self.client()?;
+            let (tx, saved) = self.begin_step(&mut client, key).await?;
+            if let Some(output) = saved {
                 tx.commit().await?;
                 tracing::info!("using saved result");
                 return Ok(output);
             }
 
             tracing::info!("executing");
-            let output = self.timed(idempotency_key, action(&tx)).await?;
-            let saved = self.save_step(&tx, idempotency_key, &output, None).await?;
+            let output = self.timed(key, action(&tx)).await?;
+            let saved = self.save_step(&tx, key, &output).await?;
             tx.commit().await?;
             tracing::info!("committed");
             Ok(saved)
         }
-        .instrument(step_span(idempotency_key))
+        .instrument(step_span(key))
         .await
-    }
-
-    /// Makes sure an effect exists. `check` looks for it and `action` runs only when `check`
-    /// returns None; whichever output they return is saved. Both receive `context`, so they
-    /// can share a client that two closures could not both capture, and the step's transaction.
-    /// If the worker dies after `action` and before the commit, the retry runs `check` again,
-    /// so a check that asks the vendor finds the effect instead of repeating it.
-    pub async fn ensure<C>(
-        &self,
-        client: &mut Client,
-        idempotency_key: &str,
-        context: &mut C,
-        check: impl AsyncFnOnce(&mut C, &Transaction<'_>) -> Result<Option<Value>>,
-        action: impl AsyncFnOnce(&mut C, &Transaction<'_>) -> Result<Value>,
-    ) -> Result<Value> {
-        async {
-            let (tx, existing, _, _) = self.begin_step(client, idempotency_key).await?;
-            if let Some(output) = existing {
-                tx.commit().await?;
-                tracing::info!("using saved result");
-                return Ok(output);
-            }
-
-            let output = self
-                .timed(idempotency_key, async {
-                    match check(&mut *context, &tx).await? {
-                        Some(output) => {
-                            tracing::info!("already done");
-                            Ok(output)
-                        }
-                        None => {
-                            tracing::info!("executing");
-                            action(&mut *context, &tx).await
-                        }
-                    }
-                })
-                .await?;
-            let saved = self.save_step(&tx, idempotency_key, &output, None).await?;
-            tx.commit().await?;
-            tracing::info!("committed");
-            Ok(saved)
-        }
-        .instrument(step_span(idempotency_key))
-        .await
-    }
-
-    /// For a change the current state must still allow, such as shipping an order only while it
-    /// is paid. `check` decides, in the same transaction as `action`, so nothing can change in
-    /// between as long as `check` locks what it reads: `select ... for update` for rows,
-    /// `lock_resource` for anything else. `Check::Skip` saves the reason and returns None, now and
-    /// on every replay; `Check::Fail` fails the run. Both closures receive `context`, as in
-    /// `ensure`.
-    pub async fn step_if<C>(
-        &self,
-        client: &mut Client,
-        idempotency_key: &str,
-        context: &mut C,
-        check: impl AsyncFnOnce(&mut C, &Transaction<'_>) -> Result<Check>,
-        action: impl AsyncFnOnce(&mut C, &Transaction<'_>) -> Result<Value>,
-    ) -> Result<Option<Value>> {
-        async {
-            let (tx, existing, _, skipped) = self.begin_step(client, idempotency_key).await?;
-            if let Some(output) = existing {
-                tx.commit().await?;
-                return Ok(match skipped {
-                    Some(reason) => {
-                        tracing::info!("skipped earlier: {reason}");
-                        None
-                    }
-                    None => {
-                        tracing::info!("using saved result");
-                        Some(output)
-                    }
-                });
-            }
-
-            let outcome = self
-                .timed(idempotency_key, async {
-                    match check(&mut *context, &tx).await? {
-                        Check::Proceed => {
-                            tracing::info!("executing");
-                            Ok(Ok(action(&mut *context, &tx).await?))
-                        }
-                        Check::Skip(reason) => Ok(Err(reason)),
-                        Check::Fail(reason) => Err(Permanent(reason).into()),
-                    }
-                })
-                .await?;
-            let saved = match outcome {
-                Ok(output) => Some(self.save_step(&tx, idempotency_key, &output, None).await?),
-                Err(reason) => {
-                    self.save_step(&tx, idempotency_key, &Value::Null, Some(&reason))
-                        .await?;
-                    tracing::info!("skipped: {reason}");
-                    None
-                }
-            };
-            tx.commit().await?;
-            if saved.is_some() {
-                tracing::info!("committed");
-            }
-            Ok(saved)
-        }
-        .instrument(step_span(idempotency_key))
-        .await
-    }
-
-    /// Whether no newer run of this workflow has the same subject (see `Producer::submit_for`),
-    /// for use in `step_if`'s check. Locks the subject until the step's transaction ends, so a
-    /// newer run's step waits for this one to commit and applies after it.
-    pub async fn is_latest(&self, tx: &Transaction<'_>) -> Result<bool> {
-        Ok(tx
-            .query_one("select resume.lock_subject($1)", &[&self.id])
-            .await?
-            .try_get(0)?)
     }
 
     /// For external effects that must not repeat, such as a vendor without idempotency.
@@ -429,34 +275,24 @@ impl Run {
     /// Returning `Snooze` also fails the run; use a regular step for readiness checks.
     pub async fn step_once(
         &self,
-        client: &mut Client,
-        idempotency_key: &str,
+        key: &str,
         action: impl AsyncFnOnce() -> Result<Value>,
     ) -> Result<Value> {
         async {
-            let (tx, existing, interrupted, _) = self.begin_step(client, idempotency_key).await?;
-            if let Some(output) = existing {
-                tx.commit().await?;
+            let mut client = self.client()?;
+            let (tx, saved) = self.begin_step(&mut client, key).await?;
+            // Commit the start before calling, so a later attempt knows the call may have happened.
+            tx.commit().await?;
+            if let Some(output) = saved {
                 tracing::info!("using saved result");
                 return Ok(output);
             }
 
-            if interrupted {
-                let error = RunFailed(format!(
-                    "step {idempotency_key} started in an earlier attempt and its outcome is unknown"
-                ));
-                self.fail_run(&tx, &error.0).await?;
-                tx.commit().await?;
-                return Err(error.into());
-            }
-            // Commit the start before calling, so a later attempt knows the call may have happened.
-            tx.commit().await?;
-
             tracing::info!("executing once");
-            let output = self.timed(idempotency_key, action()).await.map_err(|error| {
+            let output = self.timed(key, action()).await.map_err(|error| {
                 if error.is::<Snooze>() {
                     Permanent(format!(
-                        "step {idempotency_key} cannot snooze after starting a step_once action; \
+                        "step {key} cannot snooze after starting a step_once action; \
                          its outcome is unknown; use a regular step for readiness checks"
                     ))
                     .into()
@@ -466,12 +302,22 @@ impl Run {
             })?;
 
             // save_step checks the claim itself, so this needs no transaction of its own.
-            let saved = self.save_step(&*client, idempotency_key, &output, None).await?;
+            let saved = self.save_step(&*client, key, &output).await?;
             tracing::info!("committed");
             Ok(saved)
         }
-        .instrument(step_span(idempotency_key))
+        .instrument(step_span(key))
         .await
+    }
+
+    /// Whether no newer run of this workflow has the same subject (see `Producer::submit_for`),
+    /// for use in a step. Locks the subject until the step's transaction ends, so a newer run's
+    /// step waits for this one to commit and applies after it.
+    pub async fn is_latest(&self, tx: &Transaction<'_>) -> Result<bool> {
+        Ok(tx
+            .query_one("select resume.lock_subject($1)", &[&self.id])
+            .await?
+            .try_get(0)?)
     }
 
     /// This attempt's number for logs: claims so far, less claims given back.
@@ -479,16 +325,23 @@ impl Run {
         self.attempt - i64::from(self.released)
     }
 
+    /// The connection for a step. Only one step runs at a time, so it is free unless a step's
+    /// action started another step.
+    fn client(&self) -> Result<MutexGuard<'_, Client>> {
+        self.client
+            .try_lock()
+            .map_err(|_| Permanent("a step cannot start another step".into()).into())
+    }
+
     /// Starts a transaction holding the run's lock, after checking this attempt owns it, and
-    /// records the step's start. Returns the step's saved output if it already completed, and
-    /// whether an earlier attempt started it without completing it, and why step_if skipped it,
-    /// if it did. Fails the run if it is past its deadline, or if the step's position changed
-    /// since the run first reached it.
+    /// records the step's start. Returns the step's saved output if it already completed.
+    /// If the run is past its deadline, or a step_once action's outcome is unknown, commits
+    /// the run's failure and returns `RunFailed`.
     async fn begin_step<'c>(
         &self,
         client: &'c mut Client,
         key: &str,
-    ) -> Result<(Transaction<'c>, Option<Value>, bool, Option<String>)> {
+    ) -> Result<(Transaction<'c>, Option<Value>)> {
         // A stopping worker lets the step in progress finish and starts no more.
         if self.stopping.load(Ordering::Relaxed) {
             return Err(Stopping.into());
@@ -497,8 +350,7 @@ impl Run {
         let tx = client.transaction().await?;
         let row = tx
             .query_one(
-                "select output, interrupted, past_deadline, skipped
-                 from resume.begin_step($1, $2, $3, $4, $5)",
+                "select output, failed from resume.begin_step($1, $2, $3, $4, $5)",
                 &[
                     &self.id,
                     &self.attempt,
@@ -512,18 +364,12 @@ impl Run {
                 Some(db) if db.code().code() == "RS001" => Permanent(db.message().into()).into(),
                 _ => crate::Error::from(error),
             })?;
-        if row.try_get("past_deadline")? {
-            let error = RunFailed("the run passed its deadline".into());
-            self.fail_run(&tx, &error.0).await?;
+        if let Some(reason) = row.try_get::<_, Option<String>>("failed")? {
             tx.commit().await?;
-            return Err(error.into());
+            return Err(RunFailed(reason).into());
         }
-        Ok((
-            tx,
-            row.try_get("output")?,
-            row.try_get("interrupted")?,
-            row.try_get("skipped")?,
-        ))
+        let output = row.try_get("output")?;
+        Ok((tx, output))
     }
 
     /// Fails the step if its action takes longer than the step timeout. Timing out stops the
@@ -538,57 +384,107 @@ impl Run {
 
     async fn save_step(
         &self,
-        db: &impl GenericClient,
+        db: &impl tokio_postgres::GenericClient,
         key: &str,
         output: &Value,
-        skipped: Option<&str>,
     ) -> Result<Value> {
         Ok(db
             .query_one(
-                "select resume.save_step($1, $2, $3, $4, $5)",
-                &[&self.id, &self.attempt, &key, output, &skipped],
+                "select resume.save_step($1, $2, $3, $4)",
+                &[&self.id, &self.attempt, &key, output],
             )
             .await?
             .try_get(0)?)
     }
 
-    async fn complete_run(&self, db: &impl GenericClient) -> Result<()> {
-        db.execute(
-            "select resume.complete_run($1, $2)",
-            &[&self.id, &self.attempt],
-        )
-        .await?;
+    async fn complete_run(&self) -> Result<()> {
+        self.client
+            .lock()
+            .await
+            .execute(
+                "select resume.complete_run($1, $2)",
+                &[&self.id, &self.attempt],
+            )
+            .await?;
         Ok(())
     }
 
-    async fn fail_run(&self, db: &impl GenericClient, error: &str) -> Result<()> {
-        db.execute(
-            "select resume.fail_run($1, $2, $3)",
-            &[&self.id, &self.attempt, &error],
-        )
-        .await?;
-        Ok(())
-    }
+    /// Records how the attempt ended: a snoozing or stopping worker releases the run, and
+    /// any other error schedules a retry after a backoff, or fails the run if the error is
+    /// permanent or the attempt was its last.
+    async fn settle(&self, result: Result<()>) {
+        let error = match result {
+            Ok(()) => {
+                tracing::info!("completed");
+                return;
+            }
+            Err(error) => error,
+        };
+        if claim_lost(&error) {
+            tracing::warn!("stopped: {error}");
+            return;
+        }
+        if error.is::<RunFailed>() {
+            tracing::warn!("failed: {error}; run failed");
+            return;
+        }
 
-    /// Returns the delay in seconds before the next attempt.
-    async fn retry_run(&self, db: &impl GenericClient, error: &str) -> Result<f64> {
-        Ok(db
+        let released = if error.is::<Stopping>() {
+            Some((Duration::ZERO, "released for another worker".to_string()))
+        } else {
+            error.downcast_ref::<Snooze>().map(|Snooze(delay)| {
+                (
+                    *delay,
+                    format!("snoozed for {delay:?} (bounded by the run's deadline)"),
+                )
+            })
+        };
+        let client = self.client.lock().await;
+        if let Some((delay, done)) = released {
+            match client
+                .execute(
+                    "select resume.release_run($1, $2, $3)",
+                    &[&self.id, &self.attempt, &delay.as_secs_f64()],
+                )
+                .await
+            {
+                Ok(_) => tracing::info!("{done}"),
+                Err(e) => {
+                    tracing::warn!("could not release ({e}); it continues after its lease expires")
+                }
+            }
+            return;
+        }
+
+        let permanent = error.is::<Permanent>();
+        let ended = client
             .query_one(
-                "select resume.retry_run($1, $2, $3)",
-                &[&self.id, &self.attempt, &error],
+                "select resume.end_attempt($1, $2, $3, $4)",
+                &[&self.id, &self.attempt, &error.to_string(), &permanent],
             )
-            .await?
-            .try_get(0)?)
+            .await
+            .and_then(|row| row.try_get::<_, Option<f64>>(0));
+        match ended {
+            Ok(Some(seconds)) => tracing::warn!("failed: {error}; retry in {seconds:.1}s"),
+            Ok(None) if permanent => tracing::warn!("failed: {error}; permanent; run failed"),
+            Ok(None) => tracing::warn!("failed: {error}; attempt limit reached; run failed"),
+            Err(e) if e.code().is_some_and(|c| c.code() == "RS002") => {
+                tracing::warn!("failed: {error}; not recorded: {e}")
+            }
+            Err(e) => tracing::warn!(
+                "failed: {error}; could not record it ({e}), so it retries after the lease expires"
+            ),
+        }
     }
+}
 
-    async fn release_run(&self, db: &impl GenericClient, delay: Duration) -> Result<()> {
-        db.execute(
-            "select resume.release_run($1, $2, $3)",
-            &[&self.id, &self.attempt, &delay.as_secs_f64()],
-        )
-        .await?;
-        Ok(())
-    }
+/// Whether this attempt no longer owns the run: it was cancelled or reclaimed after its lease
+/// expired, so there is nothing left to record.
+fn claim_lost(error: &crate::Error) -> bool {
+    error
+        .downcast_ref::<tokio_postgres::Error>()
+        .and_then(tokio_postgres::Error::code)
+        .is_some_and(|code| code.code() == "RS002")
 }
 
 /// Log lines inside a step carry its key, under the worker's run span.
@@ -606,9 +502,19 @@ pub async fn lock_resource(tx: &Transaction<'_>, resource: &str) -> Result<()> {
     Ok(())
 }
 
+/// The run was marked failed, so no later attempt will retry it.
+#[derive(Debug)]
+struct RunFailed(String);
+
 /// The worker is stopping, so the run stops before its next step and is released.
 #[derive(Debug)]
 struct Stopping;
+
+impl fmt::Display for RunFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 impl fmt::Display for Stopping {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -616,4 +522,5 @@ impl fmt::Display for Stopping {
     }
 }
 
+impl std::error::Error for RunFailed {}
 impl std::error::Error for Stopping {}

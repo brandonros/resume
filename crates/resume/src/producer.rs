@@ -1,6 +1,5 @@
 use std::time::{Duration, SystemTime};
 
-use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tokio_postgres::GenericClient;
 
@@ -33,10 +32,15 @@ pub struct Producer<'a, C: GenericClient> {
     version: String,
     retry: RetryPolicy,
     deadline: Option<Duration>,
-    delay: Duration,
-    at: Option<SystemTime>,
-    on_failure_workflow: Option<String>,
-    on_failure_version: Option<String>,
+    start: Start,
+    /// The failure handler's workflow and version.
+    on_failure: Option<(String, String)>,
+}
+
+/// When a new run becomes eligible. A delay counts from the database's clock at submission.
+enum Start {
+    After(Duration),
+    At(SystemTime),
 }
 
 pub struct Submitted {
@@ -56,10 +60,8 @@ impl<'a, C: GenericClient> Producer<'a, C> {
             version: version.into(),
             retry: RetryPolicy::default(),
             deadline: None,
-            delay: Duration::ZERO,
-            at: None,
-            on_failure_workflow: None,
-            on_failure_version: None,
+            start: Start::After(Duration::ZERO),
+            on_failure: None,
         }
     }
 
@@ -74,8 +76,7 @@ impl<'a, C: GenericClient> Producer<'a, C> {
     /// The handler has its own three attempts; a failed handler can be reopened by an operator.
     /// Like the retry policy, this only applies when the original run is first created.
     pub fn on_failure(mut self, workflow: impl Into<String>, version: impl Into<String>) -> Self {
-        self.on_failure_workflow = Some(workflow.into());
-        self.on_failure_version = Some(version.into());
+        self.on_failure = Some((workflow.into(), version.into()));
         self
     }
 
@@ -91,30 +92,29 @@ impl<'a, C: GenericClient> Producer<'a, C> {
     /// key again keeps its original schedule. A deadline still counts from submission, so a
     /// run whose deadline comes first fails without executing. Replaces any earlier `at` call.
     pub fn delay(mut self, delay: Duration) -> Self {
-        self.delay = delay;
-        self.at = None;
+        self.start = Start::After(delay);
         self
     }
 
-    /// Insert runs now, eligible at this timestamp. Accepts a UTC datetime; parsing an ISO
-    /// 8601 / RFC 3339 string with `Z` or a UTC offset converts it to UTC. Past times are eligible
-    /// immediately. Actual execution depends on worker availability.
+    /// Insert runs now, eligible at this instant, such as a `SystemTime` or a chrono
+    /// `DateTime<Utc>`. Past times are eligible immediately. Actual execution depends on worker
+    /// availability.
     ///
     /// Applies to `submit` and `submit_for`. Replaces any earlier `delay` call; submitting an
     /// existing key keeps its original schedule. Deadlines still count from submission.
     ///
     /// ```no_run
     /// # async fn example(client: &tokio_postgres::Client) -> resume::Result<()> {
+    /// let tomorrow = std::time::SystemTime::now() + std::time::Duration::from_secs(86400);
     /// resume::Producer::new(client, "reminders", "1")
-    ///     .at("2026-09-26T00:00:00-04:00".parse()?)
+    ///     .at(tomorrow)
     ///     .submit("reminder:42", &serde_json::json!({"message": "Time to stretch"}))
     ///     .await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn at(mut self, at: DateTime<Utc>) -> Self {
-        self.at = Some(at.into());
-        self.delay = Duration::ZERO;
+    pub fn at(mut self, at: impl Into<SystemTime>) -> Self {
+        self.start = Start::At(at.into());
         self
     }
 
@@ -142,6 +142,12 @@ impl<'a, C: GenericClient> Producer<'a, C> {
         input: &Value,
         subject: Option<&str>,
     ) -> Result<Submitted> {
+        let (delay, at) = match self.start {
+            Start::After(delay) => (delay, None),
+            Start::At(at) => (Duration::ZERO, Some(at)),
+        };
+        let (on_failure_workflow, on_failure_version) =
+            self.on_failure.as_ref().map(|(w, v)| (w, v)).unzip();
         let row = self
             .client
             .query_one(
@@ -156,10 +162,10 @@ impl<'a, C: GenericClient> Producer<'a, C> {
                     &self.retry.max_delay.as_secs_f64(),
                     &subject,
                     &self.deadline.map(|d| d.as_secs_f64()),
-                    &self.delay.as_secs_f64(),
-                    &self.at,
-                    &self.on_failure_workflow,
-                    &self.on_failure_version,
+                    &delay.as_secs_f64(),
+                    &at,
+                    &on_failure_workflow,
+                    &on_failure_version,
                 ],
             )
             .await?;

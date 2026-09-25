@@ -1,5 +1,5 @@
-//! Test harness shared by the examples: worker processes to kill, stop and freeze, and checks
-//! of the workers' logs and of a workflow's invariants.
+//! Test harness shared by the examples: setup, worker processes to kill, stop and freeze, and
+//! checks of the workers' logs and of a workflow's invariants.
 
 mod rng;
 
@@ -10,9 +10,95 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use resume::Result;
-use tokio_postgres::Client;
+use tokio_postgres::{Client, NoTls};
 
 pub use rng::Rng;
+
+/// Starts logging to stderr and connects to DATABASE_URL. Returns the URL too, for workers
+/// and vendors that need connections of their own.
+pub async fn start() -> Result<(String, Client)> {
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .init();
+    let url = std::env::var("DATABASE_URL").map_err(|_| "set DATABASE_URL")?;
+    let client = connect(&url).await?;
+    Ok((url, client))
+}
+
+pub async fn connect(url: &str) -> Result<Client> {
+    let (client, connection) = tokio_postgres::connect(url, NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            tracing::error!("postgres: {error}");
+        }
+    });
+    Ok(client)
+}
+
+/// Parses an environment variable, or returns `default` if it is unset.
+pub fn env_or<T: std::str::FromStr>(name: &str, default: T) -> Result<T>
+where
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    match std::env::var(name) {
+        Ok(value) => Ok(value.parse()?),
+        Err(_) => Ok(default),
+    }
+}
+
+/// Turns whether every check held into the process's result.
+pub fn passed(held: bool) -> Result<()> {
+    if held {
+        Ok(())
+    } else {
+        Err("invariants violated".into())
+    }
+}
+
+/// Clears an example's tables and its runs, so the invariants see only this test.
+pub async fn reset(client: &Client, workflow: &str, tables: &str) -> Result<()> {
+    client
+        .batch_execute(&format!("truncate {tables} restart identity"))
+        .await?;
+    client
+        .execute("delete from resume.runs where workflow = $1", &[&workflow])
+        .await?;
+    Ok(())
+}
+
+/// Calls `tick` every `interval` until the workflow has no pending runs, or `limit` passes.
+pub async fn drive(
+    client: &Client,
+    workflow: &str,
+    limit: Duration,
+    interval: Duration,
+    mut tick: impl AsyncFnMut() -> Result<()>,
+) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        tick().await?;
+        if pending(client, workflow).await? == 0 {
+            return Ok(());
+        }
+        if start.elapsed() > limit {
+            println!("stopped waiting after {limit:?}");
+            return Ok(());
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// Checks the workers' logs in `logs`, then the workflow's invariants. Returns whether both hold.
+pub async fn verify(
+    client: &Client,
+    workflow: &str,
+    invariants: &str,
+    logs: &Path,
+) -> Result<bool> {
+    let history = check_history(logs)?;
+    Ok(check_invariants(client, workflow, invariants).await? && history)
+}
 
 pub struct Worker {
     pub child: Child,

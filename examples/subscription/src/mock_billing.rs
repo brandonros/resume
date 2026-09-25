@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use harness::Rng;
 use resume::Result;
 use tokio_postgres::Client;
@@ -26,10 +24,7 @@ impl Billing {
     }
 
     pub async fn set_plan(&mut self, customer_id: i64, plan: &str) -> Result<()> {
-        if self.latency_ms > 0 {
-            let ms = self.rng.below(self.latency_ms + 1);
-            tokio::time::sleep(Duration::from_millis(ms)).await;
-        }
+        self.rng.pause(self.latency_ms).await;
         if self.rng.chance(self.error_chance) {
             return Err("billing: 503 service unavailable".into());
         }

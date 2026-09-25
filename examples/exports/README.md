@@ -5,16 +5,13 @@ A mock vendor takes ten seconds to prepare an export. `start_export` saves its I
 The worker handles other runs until the next check is due. When ready, the workflow records
 the export's mock download URL.
 
-With the current core schema installed, run from the repository root:
+After `just reset`, which installs every schema, run from the repository root:
 
 ```sh
-just exports-schema
 just exports-submit slow 10
 just exports-submit fast 0
 just exports-process
 ```
-
-`just reset` includes this example's schema, so omit `exports-schema` if you used it.
 
 `fast` finishes while `slow` snoozes. In another terminal, `just exports-show` shows the runs,
 claim counts, attempts used, and saved results. Even after several snoozes, each completed

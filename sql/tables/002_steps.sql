@@ -7,15 +7,13 @@
 -- position means the workflow's code changed, and the run fails instead of going on.
 create table resume.steps (
     run_id bigint not null references resume.runs (id) on delete cascade,
-    idempotency_key text not null check (idempotency_key <> ''),
+    key text not null check (key <> ''),
     position integer not null check (position >= 0),
     started_at timestamptz not null,
     completed_at timestamptz,
     -- A step whose output is JSON null stores 'null'::jsonb, so SQL null means not completed.
     output jsonb,
-    -- Set when step_if's check skipped the step, to the reason it gave; output is then null.
-    skipped text,
-    primary key (run_id, idempotency_key),
+    primary key (run_id, key),
     unique (run_id, position),
     check ((completed_at is null) = (output is null))
 );

@@ -1,11 +1,14 @@
-server := "postgresql://brandon@localhost:5432"
-export DATABASE_URL := server + "/resume"
-export PATH := "/Users/brandon/Applications/Postgres.app/Contents/Versions/18/bin:" + env("PATH")
+# The PostgreSQL server, without a database name; the Postgres tools must be on PATH.
+server := env("RESUME_SERVER", "postgresql://localhost:5432")
+export DATABASE_URL := env("DATABASE_URL", server + "/resume")
+core := "sql/tables/*.sql sql/functions/*.sql sql/views/*.sql"
 
-# Drops and recreates the resume database with every schema.
-reset: && schema checkout-schema counter-schema exports-schema onboard-schema provision-schema reminders-schema shipping-schema subscription-schema tickets-schema
+# Drops and recreates the resume database with every schema, including the examples'.
+reset:
     dropdb --if-exists --force --maintenance-db "{{server}}/postgres" resume
     createdb --maintenance-db "{{server}}/postgres" resume
+    psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 --single-transaction \
+        $(printf ' -f %s' {{core}} examples/*/0*.sql)
 
 # Runs every regression scenario in examples/checks against a temporary database.
 check:
@@ -15,16 +18,8 @@ check:
     createdb --maintenance-db "{{server}}/postgres" "$check_db"
     trap 'dropdb --if-exists --force --maintenance-db "{{server}}/postgres" "$check_db"' EXIT
     export DATABASE_URL="{{server}}/$check_db"
-    files=()
-    for file in sql/tables/*.sql sql/functions/*.sql sql/views/*.sql; do
-        files+=(-f "$file")
-    done
-    psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 --single-transaction "${files[@]}"
+    psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 --single-transaction $(printf ' -f %s' {{core}})
     cargo run --quiet -p checks
-
-schema:
-    psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction \
-        $(printf ' -f %s' sql/tables/*.sql sql/functions/*.sql sql/views/*.sql)
 
 # Installs or refreshes the inspection views on an existing schema.
 views:
@@ -45,17 +40,11 @@ reopen-run run:
 cancel-run run:
     echo "select resume.cancel_run(:'run')" | psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -v run={{quote(run)}}
 
-counter-schema:
-    psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction -f examples/counter/001_results.sql
-
 counter-submit key:
     cargo run -p counter -- submit {{quote(key)}}
 
 counter-process:
     cargo run -p counter -- work
-
-onboard-schema:
-    psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction -f examples/onboard/001_onboard.sql
 
 onboard-submit email plan="pro":
     cargo run -p onboard -- submit {{quote(email)}} {{quote(plan)}}
@@ -83,17 +72,10 @@ onboard-check:
 # Shows each run and what the mock vendors did.
 onboard-show:
     psql "$DATABASE_URL" -X \
-        -c "select r.id, r.idempotency_key as email, r.attempt, \
-                case when r.completed_at is not null then 'completed' \
-                     when r.failed_at is not null then 'failed' else 'pending' end as status, \
-                (select count(*) from resume.steps s where s.run_id = r.id and s.completed_at is not null) as saved_steps, \
-                r.last_error \
-            from resume.runs r where r.workflow = 'onboard' order by r.id" \
+        -c "select id, idempotency_key as email, status, attempt, steps_completed, last_error \
+            from resume.run_status where workflow = 'onboard' order by id" \
         -c "select * from vendors.charges order by id" \
         -c "select * from vendors.emails order by id"
-
-provision-schema:
-    psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction -f examples/provision/001_provision.sql
 
 # Clears the provision data, then has workers race to create VMs for requests across teams,
 # under a per-team quota. Pass "unlocked" to drop the lock and watch teams go over quota.
@@ -103,37 +85,26 @@ provision-race teams="3" requests="50" workers="20" lock="locked":
 provision-check:
     cargo run -q -p provision -- check
 
-shipping-schema:
-    psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction -f examples/shipping/001_shipping.sql
-
-# Clears the shipping data, then ships orders while customers cancel them, with step_if checking
-# each order is still paid. Pass "separate" to check in an earlier step and watch cancelled
-# orders ship.
-shipping-race orders="200" workers="10" mode="step_if":
+# Clears the shipping data, then ships orders while customers cancel them, checking each order
+# is still paid in the same step that ships it. Pass "separate" to check in an earlier step and
+# watch cancelled orders ship.
+shipping-race orders="200" workers="10" mode="same_step":
     cargo run -q -p shipping -- race {{orders}} {{workers}} {{mode}}
 
-subscription-schema:
-    psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction -f examples/subscription/001_subscription.sql
-
 # Clears the subscription data, then has customers change plans repeatedly while workers apply
-# the changes with step_if and is_latest. Pass "step" to use a plain step and watch older plans win.
-subscription-race customers="20" changes="10" workers="10" mode="step_if":
+# the changes, skipping any a newer request replaced (is_latest). Pass "plain" to leave out the
+# check and watch older plans win.
+subscription-race customers="20" changes="10" workers="10" mode="is_latest":
     cargo run -q -p subscription -- race {{customers}} {{changes}} {{workers}} {{mode}}
 
 subscription-check:
     cargo run -q -p subscription -- check
-
-tickets-schema:
-    psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction -f examples/tickets/001_tickets.sql
 
 tickets-submit request_id attendee="Ada":
     cargo run -p tickets -- submit {{quote(request_id)}} {{quote(attendee)}}
 
 tickets-process:
     cargo run -p tickets -- work
-
-exports-schema:
-    psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction -f examples/exports/001_exports.sql
 
 # The mock vendor becomes ready after ready_after seconds; unfinished checks snooze for 2s.
 exports-submit key ready_after="10":
@@ -147,9 +118,6 @@ exports-show:
         -c "select id, idempotency_key, status, attempt, attempts_used, steps_completed, last_error \
             from resume.run_status where workflow = 'exports' order by id" \
         -c "select * from exports.results order by run_id"
-
-reminders-schema:
-    psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction -f examples/reminders/001_reminders.sql
 
 # The run is inserted now and stays unclaimed until the delay has passed.
 reminders-submit key delay="10" message="Time to stretch":
@@ -167,9 +135,6 @@ reminders-show:
         -c "select id, idempotency_key, status, attempt, available_at, last_error \
             from resume.run_status where workflow = 'reminders' order by id" \
         -c "select * from reminders.deliveries order by delivered_at"
-
-checkout-schema:
-    psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction -f examples/checkout/001_checkout.sql
 
 checkout-submit key mode="fail":
     cargo run -p checkout -- submit {{quote(key)}} {{quote(mode)}}

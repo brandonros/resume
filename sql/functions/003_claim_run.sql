@@ -27,8 +27,8 @@ begin
     end if;
 
     -- Fail waiting runs past their deadline, and runs whose final attempt's lease expired. An
-    -- attempt that returns an error goes through retry_run or fail_run instead. No attempt
-    -- holds these claims, so this cannot go through fail_run. Skip locked runs so a busy
+    -- attempt that returns an error goes through end_attempt instead. No attempt
+    -- holds these claims, so this cannot go through end_attempt. Skip locked runs so a busy
     -- worker cannot hold up claims.
     with ended as (
         select r.id, r.deadline_at <= v_now as past_deadline

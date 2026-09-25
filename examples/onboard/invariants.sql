@@ -70,18 +70,18 @@ from vendors.emails e
 join runs r on r.email = e.recipient
 where not exists (
     select 1 from resume.steps s
-    where s.run_id = r.id and s.idempotency_key = 'send_welcome_email'
+    where s.run_id = r.id and s.key = 'send_welcome_email'
 )
 
 -- Every saved step output matches what the vendor or our database holds.
 union all
 select format('run %s step %s saved %s, but the record is %s',
-              s.run_id, s.idempotency_key, s.output, coalesce(actual.id::text, 'missing'))
+              s.run_id, s.key, s.output, coalesce(actual.id::text, 'missing'))
 from resume.steps s
 join customers c on c.run_id = s.run_id
 join vendor v on v.customer_id = c.id
 cross join lateral (
-    select case s.idempotency_key
+    select case s.key
         when 'create_customer' then c.id
         when 'ensure_crm_contact' then v.crm_contact_id
         when 'ensure_billing_customer' then v.billing_customer_id
@@ -90,6 +90,6 @@ cross join lateral (
     end as id
 ) actual
 where s.completed_at is not null
-  and s.idempotency_key in ('create_customer', 'ensure_crm_contact', 'ensure_billing_customer',
+  and s.key in ('create_customer', 'ensure_crm_contact', 'ensure_billing_customer',
                             'ensure_setup_fee', 'send_welcome_email')
   and s.output is distinct from to_jsonb(actual.id)

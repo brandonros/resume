@@ -7,3 +7,5 @@ edition = "2024"
 resume = { path = "../../crates/resume" }
 tokio.workspace = true
 tokio-postgres.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

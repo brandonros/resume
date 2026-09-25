@@ -10,10 +10,9 @@ Producer::new(&client, "checkout", VERSION)
     .await?;
 ```
 
-Run from the repository root with the current core schema installed:
+After `just reset`, which installs every schema, run from the repository root:
 
 ```sh
-just checkout-schema   # omit if you used just reset
 just checkout-submit order-1
 just checkout-process
 ```

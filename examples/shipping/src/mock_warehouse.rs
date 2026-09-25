@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use harness::Rng;
 use resume::Result;
 use tokio_postgres::Client;
@@ -23,10 +21,7 @@ impl Warehouse {
     }
 
     pub async fn ship(&mut self, order_id: i64) -> Result<i64> {
-        if self.latency_ms > 0 {
-            let ms = self.rng.below(self.latency_ms + 1);
-            tokio::time::sleep(Duration::from_millis(ms)).await;
-        }
+        self.rng.pause(self.latency_ms).await;
         let id: i64 = self
             .client
             .query_one(
