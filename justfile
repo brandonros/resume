@@ -7,6 +7,14 @@ reset: && schema counter-schema onboard-schema provision-schema subscription-sch
     dropdb --if-exists --force --maintenance-db "{{server}}/postgres" resume
     createdb --maintenance-db "{{server}}/postgres" resume
 
+# Runs the tests against a scratch database, recreated each time.
+test:
+    dropdb --if-exists --force --maintenance-db "{{server}}/postgres" resume_test
+    createdb --maintenance-db "{{server}}/postgres" resume_test
+    psql "{{server}}/resume_test" -X -q -v ON_ERROR_STOP=1 --single-transaction \
+        $(printf ' -f %s' sql/tables/*.sql sql/functions/*.sql)
+    DATABASE_URL="{{server}}/resume_test" cargo test --workspace -q
+
 schema:
     psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction \
         $(printf ' -f %s' sql/tables/*.sql sql/functions/*.sql)
@@ -20,6 +28,10 @@ resolve-step run key output:
 # For operators: put a failed run back in the queue with fresh attempts.
 reopen-run run:
     echo "select resume.reopen_run(:'run')" | psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -v run={{quote(run)}}
+
+# For operators: stop a run that has not finished. A run in progress stops at its next step.
+cancel-run run:
+    echo "select resume.cancel_run(:'run')" | psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -v run={{quote(run)}}
 
 counter-schema:
     psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction -f examples/counter/001_results.sql

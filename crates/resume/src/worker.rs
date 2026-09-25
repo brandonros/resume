@@ -1,6 +1,6 @@
 use std::pin::pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Duration;
 
 use tokio_postgres::Client;
@@ -11,16 +11,21 @@ use crate::{Permanent, Result, Run, RunFailed, Stopping};
 pub struct Worker {
     client: Client,
     workflow: String,
+    version: String,
     lease: Duration,
     step_timeout: Duration,
 }
 
 impl Worker {
+    /// Claims only runs submitted for `version`, so a run's input and its steps come from the
+    /// same code. When a workflow's input or steps change, bump the version: run new workers
+    /// beside the old ones, switch producers, and retire the old workers once their runs finish.
     /// Defaults to a 60 second lease and a 30 second step timeout.
-    pub fn new(client: Client, workflow: impl Into<String>) -> Self {
+    pub fn new(client: Client, workflow: impl Into<String>, version: impl Into<String>) -> Self {
         Self {
             client,
             workflow: workflow.into(),
+            version: version.into(),
             lease: Duration::from_secs(60),
             step_timeout: Duration::from_secs(30),
         }
@@ -68,7 +73,8 @@ impl Worker {
         let stopping = Arc::new(AtomicBool::new(false));
         let mut shutdown = pin!(shutdown);
         tracing::info!(
-            "{workflow}: worker started (lease {:?}, step timeout {:?})",
+            "{workflow}: worker started (version {}, lease {:?}, step timeout {:?})",
+            self.version,
             self.lease,
             self.step_timeout
         );
@@ -133,8 +139,8 @@ impl Worker {
             .client
             .query_opt(
                 "select id, idempotency_key, input, attempt, released, max_attempts, expired
-                 from resume.claim_run($1, $2)",
-                &[&self.workflow, &self.lease.as_secs_f64()],
+                 from resume.claim_run($1, $2, $3)",
+                &[&self.workflow, &self.version, &self.lease.as_secs_f64()],
             )
             .await?;
 
@@ -149,6 +155,7 @@ impl Worker {
                 lease: self.lease,
                 step_timeout: self.step_timeout,
                 stopping: stopping.clone(),
+                position: AtomicI32::new(0),
             };
             Ok((run, row.try_get("expired")?))
         })

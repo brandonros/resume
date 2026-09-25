@@ -4,6 +4,9 @@ use resume::{Producer, Result, RetryPolicy, Run, Worker, shutdown_signal};
 use serde_json::json;
 use tokio_postgres::{Client, NoTls};
 
+/// The version of this workflow's input and steps; producers and workers must agree.
+pub const VERSION: &str = "1";
+
 async fn counter(client: &mut Client, run: &Run) -> Result<()> {
     let amount = run.input["amount"]
         .as_i64()
@@ -70,7 +73,7 @@ async fn main() -> Result<()> {
     match args.next().as_deref() {
         Some("submit") => {
             let key = args.next().ok_or("expected submit <key>")?;
-            let run = Producer::new(&client, "counter")
+            let run = Producer::new(&client, "counter", VERSION)
                 .retry(RetryPolicy {
                     max_attempts: 1,
                     ..RetryPolicy::default()
@@ -86,7 +89,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some("work") | None => {
-            Worker::new(client, "counter")
+            Worker::new(client, "counter", VERSION)
                 .run(shutdown_signal(), counter)
                 .await
         }

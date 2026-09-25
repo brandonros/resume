@@ -23,7 +23,7 @@ const RETRY: RetryPolicy = RetryPolicy {
 /// Then checks the invariants.
 pub async fn each(client: &Client) -> Result<bool> {
     reset(client).await?;
-    let producer = Producer::new(client, "onboard").retry(RETRY);
+    let producer = Producer::new(client, "onboard", crate::VERSION).retry(RETRY);
     println!(
         "{:<24} {:<6} {:<10} last error",
         "fault", "fired", "outcome"
@@ -88,7 +88,7 @@ pub async fn random(client: &Client, seed: u64, customers: usize, workers: usize
 
     let mut rng = Rng::new(seed);
     reset(client).await?;
-    let producer = Producer::new(client, "onboard").retry(RETRY);
+    let producer = Producer::new(client, "onboard", crate::VERSION).retry(RETRY);
     let mut inputs = Vec::new();
     for i in 0..customers {
         let email = if rng.chance(0.05) {
@@ -225,7 +225,7 @@ pub async fn race(
         let database_url = database_url.to_string();
         tasks.spawn(async move {
             let client = crate::connect(&database_url).await?;
-            let producer = Producer::new(&client, "onboard").retry(RETRY);
+            let producer = Producer::new(&client, "onboard", crate::VERSION).retry(RETRY);
             let mut order: Vec<usize> = (0..customers).collect();
             let mut rng = Rng::new(n as u64);
             for i in (1..order.len()).rev() {

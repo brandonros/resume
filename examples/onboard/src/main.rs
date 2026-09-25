@@ -9,6 +9,9 @@ use resume::{Permanent, Producer, Result, Run, Worker, lock_resource, shutdown_s
 use serde_json::json;
 use tokio_postgres::{Client, NoTls};
 
+/// The version of this workflow's input and steps; producers and workers must agree.
+pub const VERSION: &str = "1";
+
 const SETUP_FEE_CENTS: i64 = 5000;
 
 // Short limits, so retries and recovery in the demo come quickly.
@@ -193,7 +196,7 @@ async fn main() -> Result<()> {
             let email = args.next().ok_or("expected submit <email> [plan]")?;
             let plan = args.next().unwrap_or_else(|| "pro".into());
             // One run per email, so onboarding a customer again returns the first run.
-            let run = Producer::new(&client, "onboard")
+            let run = Producer::new(&client, "onboard", VERSION)
                 .submit(&email, &json!({"email": email, "plan": plan}))
                 .await?;
             let status = if run.created {
@@ -211,7 +214,7 @@ async fn main() -> Result<()> {
                 tracing::warn!("fault plan: {spec}");
             }
             let mut vendors = Vendors::new(connect(&database_url).await?, faults);
-            Worker::new(client, "onboard")
+            Worker::new(client, "onboard", VERSION)
                 .lease(LEASE)
                 .step_timeout(STEP_TIMEOUT)
                 .run(shutdown_signal(), async |client, run| {

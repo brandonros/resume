@@ -10,6 +10,9 @@ use resume::{
 use serde_json::json;
 use tokio_postgres::{Client, NoTls};
 
+/// The version of this workflow's input and steps; producers and workers must agree.
+pub const VERSION: &str = "1";
+
 /// VMs each team may have.
 const QUOTA: i64 = 3;
 const LEASE: Duration = Duration::from_secs(5);
@@ -81,7 +84,7 @@ async fn race(
              delete from resume.runs where workflow = 'provision';",
         )
         .await?;
-    let producer = Producer::new(client, "provision").retry(RetryPolicy {
+    let producer = Producer::new(client, "provision", VERSION).retry(RetryPolicy {
         max_attempts: 8,
         delay: Duration::from_millis(100),
         max_delay: Duration::from_secs(1),
@@ -182,7 +185,7 @@ async fn main() -> Result<()> {
         Some("submit") => {
             let request_id = args.next().ok_or("expected submit <request_id> <team>")?;
             let team = args.next().ok_or("expected submit <request_id> <team>")?;
-            let run = Producer::new(&client, "provision")
+            let run = Producer::new(&client, "provision", VERSION)
                 .submit(&request_id, &json!({"team": team}))
                 .await?;
             tracing::info!("submitted run {} for request {request_id}", run.id);
@@ -197,7 +200,7 @@ async fn main() -> Result<()> {
             );
             // UNLOCKED=1 drops the lock, to show what it prevents.
             let locked = env_or("UNLOCKED", 0)? == 0;
-            Worker::new(client, "provision")
+            Worker::new(client, "provision", VERSION)
                 .lease(LEASE)
                 .step_timeout(STEP_TIMEOUT)
                 .run(shutdown_signal(), async |client, run| {

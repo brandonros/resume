@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio_postgres::Client;
+use tokio_postgres::GenericClient;
 
 use crate::Result;
 
@@ -26,10 +26,12 @@ impl Default for RetryPolicy {
     }
 }
 
-pub struct Producer<'a> {
-    client: &'a Client,
+pub struct Producer<'a, C: GenericClient> {
+    client: &'a C,
     workflow: String,
+    version: String,
     retry: RetryPolicy,
+    deadline: Option<Duration>,
 }
 
 pub struct Submitted {
@@ -38,18 +40,30 @@ pub struct Submitted {
     pub created: bool,
 }
 
-impl<'a> Producer<'a> {
-    pub fn new(client: &'a Client, workflow: impl Into<String>) -> Self {
+impl<'a, C: GenericClient> Producer<'a, C> {
+    /// `client` can be a transaction, so a request's own changes and the runs it submits
+    /// commit together, or not at all. Runs are submitted for `version` of the workflow, and
+    /// only workers of that version claim them.
+    pub fn new(client: &'a C, workflow: impl Into<String>, version: impl Into<String>) -> Self {
         Self {
             client,
             workflow: workflow.into(),
+            version: version.into(),
             retry: RetryPolicy::default(),
+            deadline: None,
         }
     }
 
     /// Sets the retry policy for runs this producer creates.
     pub fn retry(mut self, retry: RetryPolicy) -> Self {
         self.retry = retry;
+        self
+    }
+
+    /// Fails runs this producer creates if they have not completed within `deadline` of being
+    /// submitted, whether they are waiting or in progress.
+    pub fn deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = Some(deadline);
         self
     }
 
@@ -79,15 +93,17 @@ impl<'a> Producer<'a> {
         let row = self
             .client
             .query_one(
-                "select run_id, created from resume.submit_run($1, $2, $3, $4, $5, $6, $7)",
+                "select run_id, created from resume.submit_run($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                 &[
                     &self.workflow,
+                    &self.version,
                     &idempotency_key,
                     input,
                     &self.retry.max_attempts,
                     &self.retry.delay.as_secs_f64(),
                     &self.retry.max_delay.as_secs_f64(),
                     &subject,
+                    &self.deadline.map(|d| d.as_secs_f64()),
                 ],
             )
             .await?;

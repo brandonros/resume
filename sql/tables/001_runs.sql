@@ -9,6 +9,11 @@ create table resume.runs (
     -- The record this run changes, such as 'customer:42'. step_latest runs only in the newest
     -- run of the workflow with the same subject.
     subject text check (subject <> ''),
+    -- The workflow version the producer submitted the run for. Only workers of that version
+    -- claim it, so its input and its steps come from the same code.
+    version text not null check (version <> ''),
+    -- If set, the run fails once this passes, whether it is waiting or in progress.
+    deadline_at timestamptz,
     -- Increases with every claim and identifies which claim owns the run.
     attempt bigint not null default 0 check (attempt >= 0),
     -- Claims that do not count against max_attempts: those a stopping worker gave back, and
@@ -33,5 +38,5 @@ create table resume.runs (
 
 create index runs_subject on resume.runs (workflow, subject, id) where subject is not null;
 
-create index runs_available on resume.runs (workflow, available_at, id)
+create index runs_available on resume.runs (workflow, version, available_at, id)
     where completed_at is null and failed_at is null;

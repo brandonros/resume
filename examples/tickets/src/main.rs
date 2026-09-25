@@ -5,6 +5,9 @@ use resume::{Producer, Result, Run, Worker, shutdown_signal};
 use serde_json::json;
 use tokio_postgres::{Client, NoTls};
 
+/// The version of this workflow's input and steps; producers and workers must agree.
+pub const VERSION: &str = "1";
+
 async fn tickets(client: &mut Client, run: &Run, issuer: &mut MockIssuer) -> Result<()> {
     // The run's idempotency key, so duplicate submissions of a request share one run.
     let request_id = &run.idempotency_key;
@@ -62,7 +65,7 @@ async fn main() -> Result<()> {
                 .next()
                 .ok_or("expected submit <request_id> [attendee]")?;
             let attendee = args.next().unwrap_or_else(|| "Ada".into());
-            let run = Producer::new(&client, "tickets")
+            let run = Producer::new(&client, "tickets", VERSION)
                 .submit(&request_id, &json!({"attendee": attendee}))
                 .await?;
             let status = if run.created {
@@ -75,7 +78,7 @@ async fn main() -> Result<()> {
         }
         Some("work") | None => {
             let mut issuer = MockIssuer::new(connect(&database_url).await?);
-            Worker::new(client, "tickets")
+            Worker::new(client, "tickets", VERSION)
                 .run(shutdown_signal(), async |client, run| {
                     tickets(client, run, &mut issuer).await
                 })

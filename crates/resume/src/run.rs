@@ -1,12 +1,12 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
 use tokio_postgres::{Client, GenericClient, Transaction};
 use tracing::Instrument;
 
-use crate::{Result, RunFailed, Stopping};
+use crate::{Permanent, Result, RunFailed, Stopping};
 
 pub struct Run {
     pub id: i64,
@@ -18,6 +18,8 @@ pub struct Run {
     pub(crate) lease: Duration,
     pub(crate) step_timeout: Duration,
     pub(crate) stopping: Arc<AtomicBool>,
+    /// The position the next step will have in this attempt.
+    pub(crate) position: AtomicI32,
 }
 
 impl Run {
@@ -182,7 +184,8 @@ impl Run {
 
     /// Starts a transaction holding the run's lock, after checking this attempt owns it, and
     /// records the step's start. Returns the step's saved output if it already completed, and
-    /// whether an earlier attempt started it without completing it.
+    /// whether an earlier attempt started it without completing it. Fails the run if it is past
+    /// its deadline, or if the step's position changed since the run first reached it.
     async fn begin_step<'c>(
         &self,
         client: &'c mut Client,
@@ -192,13 +195,31 @@ impl Run {
         if self.stopping.load(Ordering::Relaxed) {
             return Err(Stopping.into());
         }
+        let position = self.position.fetch_add(1, Ordering::Relaxed);
         let tx = client.transaction().await?;
         let row = tx
             .query_one(
-                "select output, interrupted from resume.begin_step($1, $2, $3, $4)",
-                &[&self.id, &self.attempt, &key, &self.lease.as_secs_f64()],
+                "select output, interrupted, past_deadline
+                 from resume.begin_step($1, $2, $3, $4, $5)",
+                &[
+                    &self.id,
+                    &self.attempt,
+                    &key,
+                    &position,
+                    &self.lease.as_secs_f64(),
+                ],
             )
-            .await?;
+            .await
+            .map_err(|error| match error.as_db_error() {
+                Some(db) if db.code().code() == "RS001" => Permanent(db.message().into()).into(),
+                _ => crate::Error::from(error),
+            })?;
+        if row.try_get("past_deadline")? {
+            let error = RunFailed("the run passed its deadline".into());
+            self.fail_run(&tx, &error.0).await?;
+            tx.commit().await?;
+            return Err(error.into());
+        }
         Ok((tx, row.try_get("output")?, row.try_get("interrupted")?))
     }
 

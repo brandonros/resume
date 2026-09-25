@@ -1,8 +1,10 @@
--- Returns zero or one run. Commit this claim before executing user code. `expired` says the
--- previous attempt's lease expired without it handing the run back, as after a crash.
+-- Returns zero or one run submitted for this workflow version. Commit this claim before
+-- executing user code. `expired` says the previous attempt's lease expired without
+-- it handing the run back, as after a crash.
 -- The lease must outlast one step, since begin_step renews it at the start of each step.
 create or replace function resume.claim_run(
     p_workflow text,
+    p_version text,
     p_lease_seconds double precision
 )
 returns table (
@@ -24,23 +26,25 @@ begin
         raise exception 'lease seconds must be positive' using errcode = '22023';
     end if;
 
-    -- Fail runs whose final attempt's lease expired. An attempt that returns an error goes
-    -- through retry_run or fail_run instead. No attempt holds these claims, so this cannot
-    -- go through fail_run. Skip locked runs so a busy worker cannot hold up claims.
-    with exhausted as (
-        select r.id
+    -- Fail waiting runs past their deadline, and runs whose final attempt's lease expired. An
+    -- attempt that returns an error goes through retry_run or fail_run instead. No attempt
+    -- holds these claims, so this cannot go through fail_run. Skip locked runs so a busy
+    -- worker cannot hold up claims.
+    with ended as (
+        select r.id, r.deadline_at <= v_now as past_deadline
         from resume.runs r
         where r.workflow = p_workflow
           and r.completed_at is null
           and r.failed_at is null
-          and r.attempt - r.released >= r.max_attempts
           and r.available_at <= v_now
+          and (r.attempt - r.released >= r.max_attempts or r.deadline_at <= v_now)
         for update skip locked
     )
     update resume.runs r
     set failed_at = clock_timestamp(),
-        last_error = format('attempt %s''s lease expired', r.attempt - r.released)
-    from exhausted e
+        last_error = case when e.past_deadline then 'the run passed its deadline'
+            else format('attempt %s''s lease expired', r.attempt - r.released) end
+    from ended e
     where r.id = e.id;
 
     return query
@@ -52,6 +56,7 @@ begin
           and r.failed_at is null
           and r.attempt - r.released < r.max_attempts
           and r.available_at <= v_now
+          and r.version = p_version
         order by r.available_at, r.id
         limit 1
         for update skip locked

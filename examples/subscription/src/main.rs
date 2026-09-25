@@ -8,6 +8,9 @@ use resume::{Producer, Result, RetryPolicy, Run, Worker, lock_resource, shutdown
 use serde_json::json;
 use tokio_postgres::{Client, NoTls, Transaction};
 
+/// The version of this workflow's input and steps; producers and workers must agree.
+pub const VERSION: &str = "1";
+
 const PLANS: [&str; 3] = ["free", "pro", "team"];
 const LEASE: Duration = Duration::from_secs(5);
 const STEP_TIMEOUT: Duration = Duration::from_secs(3);
@@ -83,7 +86,7 @@ async fn race(
         ])?;
     }
 
-    let producer = Producer::new(client, "subscription").retry(RetryPolicy {
+    let producer = Producer::new(client, "subscription", VERSION).retry(RetryPolicy {
         max_attempts: 20,
         delay: Duration::from_millis(50),
         max_delay: Duration::from_millis(500),
@@ -163,7 +166,7 @@ async fn main() -> Result<()> {
                 env_or("ERROR_CHANCE", 0.0)?,
             );
             let plain = env_or("PLAIN", 0)? == 1;
-            Worker::new(client, "subscription")
+            Worker::new(client, "subscription", VERSION)
                 .lease(LEASE)
                 .step_timeout(STEP_TIMEOUT)
                 .run(shutdown_signal(), async |client, run| {
