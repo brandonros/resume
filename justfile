@@ -11,6 +11,16 @@ schema:
     psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction \
         $(printf ' -f %s' sql/tables/*.sql sql/functions/*.sql)
 
+# For operators: after checking the vendor, record an interrupted step_once step's output and
+# continue the run, e.g. just resolve-step 7 send_welcome_email 42
+resolve-step run key output:
+    echo "select resume.resolve_step(:'run', :'key', :'output')" | psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 \
+        -v run={{quote(run)}} -v key={{quote(key)}} -v output={{quote(output)}}
+
+# For operators: put a failed run back in the queue with fresh attempts.
+reopen-run run:
+    echo "select resume.reopen_run(:'run')" | psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -v run={{quote(run)}}
+
 counter-schema:
     psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction -f examples/counter/001_results.sql
 
@@ -37,6 +47,11 @@ onboard-each:
 # Clears the onboard data, then onboards customers under random faults and signals.
 onboard-chaos seed="1" customers="50" workers="3":
     cargo run -q -p onboard -- chaos {{seed}} {{customers}} {{workers}}
+
+# Clears the onboard data, then submits every customer from many producers at once while many
+# workers process them.
+onboard-race producers="10" workers="10" customers="100":
+    cargo run -q -p onboard -- race {{producers}} {{workers}} {{customers}}
 
 onboard-check:
     cargo run -q -p onboard -- check

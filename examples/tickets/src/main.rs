@@ -32,7 +32,7 @@ async fn tickets(client: &mut Client, run: &Run, issuer: &mut MockIssuer) -> Res
             Ok(json!(format!("ticket #{ticket_id} for {attendee}")))
         })
         .await?;
-    tracing::info!("run {}: receipt = {receipt}", run.id);
+    tracing::info!("receipt = {receipt}");
     Ok(())
 }
 

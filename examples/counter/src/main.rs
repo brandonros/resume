@@ -47,7 +47,7 @@ async fn counter(client: &mut Client, run: &Run) -> Result<()> {
         })
         .await?;
 
-    tracing::info!("run {}: result = {output}", run.id);
+    tracing::info!("result = {output}");
     Ok(())
 }
 

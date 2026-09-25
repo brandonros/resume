@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio_postgres::Client;
+use tracing::Instrument;
 
 use crate::{Permanent, Result, Run, RunFailed, Stopping};
 
@@ -49,6 +50,20 @@ impl Worker {
         if self.step_timeout >= self.lease {
             return Err("step timeout must be shorter than the lease".into());
         }
+        // If this worker hangs or its host disappears mid-step, Postgres ends the step's
+        // transaction, releasing the run's row lock, instead of holding it until the connection
+        // closes. A healthy step finishes within the lease, since the step timeout is shorter.
+        let lease_ms = self.lease.as_millis();
+        self.client
+            .batch_execute(&format!(
+                "set idle_in_transaction_session_timeout = {lease_ms};
+                 set statement_timeout = {lease_ms};
+                 set tcp_keepalives_idle = 10;
+                 set tcp_keepalives_interval = 5;
+                 set tcp_keepalives_count = 3;"
+            ))
+            .await?;
+
         let workflow = self.workflow.clone();
         let stopping = Arc::new(AtomicBool::new(false));
         let mut shutdown = pin!(shutdown);
@@ -59,7 +74,7 @@ impl Worker {
         );
         let mut waiting = false;
         while !stopping.load(Ordering::Relaxed) {
-            let Some(run) = self.claim_run(&stopping).await? else {
+            let Some((run, expired)) = self.claim_run(&stopping).await? else {
                 if !waiting {
                     tracing::info!("{workflow}: waiting for work");
                     waiting = true;
@@ -72,17 +87,27 @@ impl Worker {
             };
 
             waiting = false;
-            tracing::info!(
-                "run {} attempt {}/{}: claimed",
-                run.id,
-                run.number(),
-                run.max_attempts
+            // Every log line about this run, including its steps', carries these fields.
+            let span = tracing::info_span!(
+                "run",
+                workflow = %workflow,
+                id = run.id,
+                attempt = run.number()
             );
+            let claimed = format!("claimed ({}/{})", run.number(), run.max_attempts);
+            if expired {
+                tracing::warn!(parent: &span, "{claimed}; the previous attempt's lease expired");
+            } else {
+                tracing::info!(parent: &span, "{claimed}");
+            }
             let result = {
-                let mut work = pin!(async {
-                    execute(&mut self.client, &run).await?;
-                    run.complete_run(&self.client).await
-                });
+                let mut work = pin!(
+                    async {
+                        execute(&mut self.client, &run).await?;
+                        run.complete_run(&self.client).await
+                    }
+                    .instrument(span.clone())
+                );
                 let finished = tokio::select! {
                     result = &mut work => Some(result),
                     () = &mut shutdown => None,
@@ -90,30 +115,31 @@ impl Worker {
                 match finished {
                     Some(result) => result,
                     None => {
-                        tracing::info!("{workflow}: stopping after run {}'s current step", run.id);
+                        tracing::info!(parent: &span, "worker stopping; finishing the current step");
                         stopping.store(true, Ordering::Relaxed);
                         work.await
                     }
                 }
             };
-            self.settle(&run, result).await;
+            self.settle(&run, result).instrument(span).await;
         }
         tracing::info!("{workflow}: worker stopped");
         Ok(())
     }
 
-    async fn claim_run(&self, stopping: &Arc<AtomicBool>) -> Result<Option<Run>> {
+    /// Returns the claimed run, and whether the previous attempt's lease expired.
+    async fn claim_run(&self, stopping: &Arc<AtomicBool>) -> Result<Option<(Run, bool)>> {
         let row = self
             .client
             .query_opt(
-                "select id, idempotency_key, input, attempt, released, max_attempts
+                "select id, idempotency_key, input, attempt, released, max_attempts, expired
                  from resume.claim_run($1, $2)",
                 &[&self.workflow, &self.lease.as_secs_f64()],
             )
             .await?;
 
         row.map(|row| {
-            Ok(Run {
+            let run = Run {
                 id: row.try_get("id")?,
                 idempotency_key: row.try_get("idempotency_key")?,
                 input: row.try_get("input")?,
@@ -123,7 +149,8 @@ impl Worker {
                 lease: self.lease,
                 step_timeout: self.step_timeout,
                 stopping: stopping.clone(),
-            })
+            };
+            Ok((run, row.try_get("expired")?))
         })
         .transpose()
     }
@@ -131,10 +158,9 @@ impl Worker {
     /// Records how the attempt ended: a retryable error schedules a retry after a backoff,
     /// a permanent one fails the run, and a stopping worker releases it.
     async fn settle(&self, run: &Run, result: Result<()>) {
-        let (id, number, max) = (run.id, run.number(), run.max_attempts);
         let error = match result {
             Ok(()) => {
-                tracing::info!("run {id}: completed");
+                tracing::info!("completed");
                 return;
             }
             Err(error) => error,
@@ -142,10 +168,10 @@ impl Worker {
 
         if error.is::<Stopping>() {
             match run.release_run(&self.client).await {
-                Ok(()) => tracing::info!("run {id}: released for another worker"),
-                Err(e) => tracing::warn!(
-                    "run {id}: could not release ({e}); it continues after its lease expires"
-                ),
+                Ok(()) => tracing::info!("released for another worker"),
+                Err(e) => {
+                    tracing::warn!("could not release ({e}); it continues after its lease expires")
+                }
             }
             return;
         }
@@ -156,7 +182,7 @@ impl Worker {
             run.fail_run(&self.client, &error.to_string())
                 .await
                 .map(|()| "permanent; run failed".to_string())
-        } else if number >= i64::from(max) {
+        } else if run.number() >= i64::from(run.max_attempts) {
             run.fail_run(&self.client, &error.to_string())
                 .await
                 .map(|()| "attempt limit reached; run failed".to_string())
@@ -166,10 +192,9 @@ impl Worker {
                 .map(|seconds| format!("retry in {seconds:.1}s"))
         };
         match next {
-            Ok(next) => tracing::warn!("run {id} attempt {number}/{max}: failed: {error}; {next}"),
+            Ok(next) => tracing::warn!("failed: {error}; {next}"),
             Err(e) => tracing::warn!(
-                "run {id} attempt {number}/{max}: failed: {error}; could not record it ({e}), \
-                 so it retries after the lease expires"
+                "failed: {error}; could not record it ({e}), so it retries after the lease expires"
             ),
         }
     }

@@ -8,7 +8,8 @@ create table resume.runs (
     input jsonb not null,
     -- Increases with every claim and identifies which claim owns the run.
     attempt bigint not null default 0 check (attempt >= 0),
-    -- Claims a stopping worker gave back. They do not count against max_attempts.
+    -- Claims that do not count against max_attempts: those a stopping worker gave back, and
+    -- every claim before an operator reopened the run.
     released integer not null default 0 check (released >= 0),
     max_attempts integer not null default 1 check (max_attempts > 0),
     -- The wait after a failed attempt starts at retry_delay and doubles, up to retry_max_delay.
@@ -17,6 +18,9 @@ create table resume.runs (
     -- Next time this run may be claimed. While claimed, this is when the lease expires;
     -- each step renews it.
     available_at timestamptz not null default clock_timestamp(),
+    -- Set by a claim and cleared when the attempt hands the run back. A claim that finds it
+    -- still set knows the previous attempt's lease expired, as after a crash.
+    leased boolean not null default false,
     completed_at timestamptz,
     failed_at timestamptz,
     last_error text,

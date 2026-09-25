@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::fs::{self, File};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
@@ -37,11 +38,17 @@ pub async fn each(client: &Client) -> Result<bool> {
         let mut pool = Pool::new(&format!("each/{point}"))?;
         pool.spawn(&format!("{point}=once"))?;
 
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let start = Instant::now();
+        let mut helper = false;
         let (status, error) = loop {
-            // A crashed worker is replaced by one without faults.
+            // A crashed worker is replaced by one without faults, and a frozen one gets a
+            // second worker to take over from it.
             if pool.reap() > 0 {
                 pool.spawn("")?;
+            }
+            if point.ends_with(".freeze") && !helper && start.elapsed() > Duration::from_secs(1) {
+                pool.spawn("")?;
+                helper = true;
             }
             let row = client
                 .query_one(
@@ -55,7 +62,7 @@ pub async fn each(client: &Client) -> Result<bool> {
             if let Some(status) = row.try_get::<_, Option<String>>(0)? {
                 break (status, row.try_get::<_, Option<String>>(1)?);
             }
-            if Instant::now() > deadline {
+            if start.elapsed() > Duration::from_secs(60) {
                 break ("pending".to_string(), None);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -71,7 +78,8 @@ pub async fn each(client: &Client) -> Result<bool> {
             error.unwrap_or_default()
         );
     }
-    check(client).await
+    let history = check_history(Path::new("target/chaos/each"))?;
+    Ok(check(client).await? && history)
 }
 
 /// Onboards `customers` under random vendor faults while randomly killing workers, stopping
@@ -115,12 +123,15 @@ pub async fn random(client: &Client, seed: u64, customers: usize, workers: usize
     let mut duplicate_run = false;
     let start = Instant::now();
     loop {
+        let now = Instant::now();
         pool.reap();
-        while pool.workers.len() < workers {
+        pool.thaw(now);
+        // Like a process manager with liveness probes, replace workers that are frozen, whether
+        // by a signal or by a freeze fault.
+        pool.notice_frozen(now + LEASE * 4);
+        while pool.running() < workers {
             pool.spawn(&plan(pool.spawned + 1))?;
         }
-        let now = Instant::now();
-        pool.thaw(now);
 
         if now - start < CHAOS_FOR {
             let running: Vec<usize> = (0..pool.workers.len())
@@ -138,10 +149,15 @@ pub async fn random(client: &Client, seed: u64, customers: usize, workers: usize
                         terms += 1;
                     }
                     _ => {
-                        // Past the lease, so another worker can take over its run.
+                        // Past the lease, so another worker can take over its run. A third of
+                        // freezes last long enough that only Postgres's timeouts free the run.
                         signal(&worker.child, "-STOP");
-                        let extra = Duration::from_millis(1000 + rng.below(2000));
-                        worker.frozen_until = Some(now + LEASE + extra);
+                        let freeze = if rng.chance(1.0 / 3.0) {
+                            LEASE * 4
+                        } else {
+                            LEASE + Duration::from_millis(1000 + rng.below(2000))
+                        };
+                        worker.frozen_until = Some(now + freeze);
                         freezes += 1;
                     }
                 }
@@ -183,7 +199,90 @@ pub async fn random(client: &Client, seed: u64, customers: usize, workers: usize
         .collect();
     println!("faults fired: {}", fired.join(", "));
     println!("logs: {}", pool.logs.display());
-    Ok(check(client).await? && !duplicate_run)
+    let history = check_history(&pool.logs)?;
+    Ok(check(client).await? && history && !duplicate_run)
+}
+
+/// Starts `workers` workers, then has `producers` producers, each on its own connection, all
+/// submit every one of `customers` at once, in different orders. No faults, only a little
+/// vendor latency to widen race windows. Checks that each key created exactly one run, then the
+/// history and the invariants.
+pub async fn race(
+    database_url: &str,
+    client: &Client,
+    producers: usize,
+    workers: usize,
+    customers: usize,
+) -> Result<bool> {
+    const LIMIT: Duration = Duration::from_secs(300);
+
+    reset(client).await?;
+    let mut pool = Pool::new(&format!("race-{producers}x{workers}"))?;
+    for _ in 0..workers {
+        pool.spawn("latency_ms=20")?;
+    }
+
+    let start = Instant::now();
+    let mut tasks = tokio::task::JoinSet::new();
+    for n in 0..producers {
+        let database_url = database_url.to_string();
+        tasks.spawn(async move {
+            let client = crate::connect(&database_url).await?;
+            let producer = Producer::new(&client, "onboard").retry(RETRY);
+            let mut order: Vec<usize> = (0..customers).collect();
+            let mut rng = Rng::new(n as u64);
+            for i in (1..order.len()).rev() {
+                order.swap(i, rng.below(i as u64 + 1) as usize);
+            }
+            let mut created = Vec::new();
+            for i in order {
+                let email = format!("c{i}@example.com");
+                let plan = if i % 2 == 0 { "pro" } else { "free" };
+                if producer
+                    .submit(&email, &json!({"email": email, "plan": plan}))
+                    .await?
+                    .created
+                {
+                    created.push(i);
+                }
+            }
+            Ok::<_, resume::Error>(created)
+        });
+    }
+    let mut created = vec![0; customers];
+    while let Some(result) = tasks.join_next().await {
+        for i in result?? {
+            created[i] += 1;
+        }
+    }
+    let mut held = true;
+    for (i, n) in created.iter().enumerate() {
+        if *n != 1 {
+            println!("VIOLATION: c{i}@example.com created {n} runs");
+            held = false;
+        }
+    }
+    let submitted = start.elapsed();
+
+    while pending(client).await? > 0 && start.elapsed() < LIMIT {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let elapsed = start.elapsed();
+    pool.stop().await;
+
+    println!(
+        "{producers} producers x {workers} workers, {customers} customers: {} submits in {:.1}s, \
+         all runs done in {:.1}s ({:.0} runs/s)",
+        producers * customers,
+        submitted.as_secs_f64(),
+        elapsed.as_secs_f64(),
+        customers as f64 / elapsed.as_secs_f64()
+    );
+    if held {
+        println!("submits: every key created exactly one run");
+    }
+    let history = check_history(&pool.logs)?;
+    Ok(check(client).await? && history && held)
 }
 
 /// Runs the invariants and prints each violation. Returns whether they all hold.
@@ -209,6 +308,54 @@ pub async fn check(client: &Client) -> Result<bool> {
         println!("invariants: all hold");
     }
     Ok(violations.is_empty())
+}
+
+/// Checks the workers' logs, across every attempt of every run: no step committed twice, which
+/// would mean two attempts both owned the run, and no step_once action started twice.
+fn check_history(dir: &Path) -> Result<bool> {
+    let mut counts: HashMap<(String, String, String), usize> = HashMap::new();
+    for log in log_files(dir)? {
+        for line in fs::read_to_string(log)?.lines() {
+            if let Some((run, key, message @ ("committed" | "executing once"))) = step_event(line) {
+                *counts
+                    .entry((run.to_string(), key.to_string(), message.to_string()))
+                    .or_default() += 1;
+            }
+        }
+    }
+    let mut held = true;
+    for ((run, key, message), n) in &counts {
+        if *n > 1 {
+            println!("VIOLATION: run {run} step {key} logged {message:?} {n} times");
+            held = false;
+        }
+    }
+    if held {
+        println!("history: {} step events checked, all hold", counts.len());
+    }
+    Ok(held)
+}
+
+/// Parses a log line inside a step into its run ID, step key, and message.
+fn step_event(line: &str) -> Option<(&str, &str, &str)> {
+    let rest = &line[line.find("run{")?..];
+    let run = rest.split(" id=").nth(1)?.split([' ', '}']).next()?;
+    let rest = &rest[rest.find(":step{key=\"")? + ":step{key=\"".len()..];
+    let (key, message) = rest.split_once("\"}: ")?;
+    Some((run, key, message))
+}
+
+fn log_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            files.extend(log_files(&path)?);
+        } else {
+            files.push(path);
+        }
+    }
+    Ok(files)
 }
 
 /// Clears the example's data, so the invariants see only this test.
@@ -238,6 +385,13 @@ fn points() -> impl Iterator<Item = String> {
     CALLS
         .iter()
         .flat_map(|call| KINDS.iter().map(move |kind| format!("{call}.{kind}")))
+}
+
+fn is_stopped(child: &Child) -> bool {
+    Command::new("ps")
+        .args(["-o", "stat=", "-p", &child.id().to_string()])
+        .output()
+        .is_ok_and(|out| out.stdout.starts_with(b"T"))
 }
 
 fn signal(child: &Child, signal: &str) {
@@ -295,6 +449,22 @@ impl Pool {
         before - self.workers.len()
     }
 
+    fn running(&self) -> usize {
+        self.workers
+            .iter()
+            .filter(|w| w.frozen_until.is_none())
+            .count()
+    }
+
+    /// Marks workers that stopped themselves as frozen, to thaw at `until`.
+    fn notice_frozen(&mut self, until: Instant) {
+        for worker in &mut self.workers {
+            if worker.frozen_until.is_none() && is_stopped(&worker.child) {
+                worker.frozen_until = Some(until);
+            }
+        }
+    }
+
     fn thaw(&mut self, now: Instant) {
         for worker in &mut self.workers {
             if worker.frozen_until.is_some_and(|until| until <= now) {
@@ -304,12 +474,12 @@ impl Pool {
         }
     }
 
-    /// Thaws and stops every worker, then waits for them to exit.
+    /// Thaws and stops every worker, including ones that froze themselves, then waits for
+    /// them to exit.
     async fn stop(&mut self) {
         for worker in &mut self.workers {
-            if worker.frozen_until.take().is_some() {
-                signal(&worker.child, "-CONT");
-            }
+            worker.frozen_until = None;
+            signal(&worker.child, "-CONT");
             signal(&worker.child, "-TERM");
         }
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -327,8 +497,8 @@ impl Pool {
     /// How many times each fault point fired, from the workers' logs.
     fn faults_fired(&self) -> Result<Vec<(String, usize)>> {
         let mut logs = String::new();
-        for entry in fs::read_dir(&self.logs)? {
-            logs += &fs::read_to_string(entry?.path())?;
+        for log in log_files(&self.logs)? {
+            logs += &fs::read_to_string(log)?;
         }
         Ok(points()
             .filter_map(|point| {

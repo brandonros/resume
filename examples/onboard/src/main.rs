@@ -157,7 +157,7 @@ async fn onboard(client: &mut Client, run: &Run, v: &mut Vendors) -> Result<()> 
     })
     .await?;
 
-    tracing::info!("run {}: onboarded customer {customer_id}", run.id);
+    tracing::info!("onboarded customer {customer_id}");
     Ok(())
 }
 
@@ -227,9 +227,16 @@ async fn main() -> Result<()> {
             let workers = args.next().map_or(Ok(3), |s| s.parse())?;
             passed(chaos::random(&client, seed, customers, workers).await?)
         }
+        Some("race") => {
+            let producers = args.next().map_or(Ok(10), |s| s.parse())?;
+            let workers = args.next().map_or(Ok(10), |s| s.parse())?;
+            let customers = args.next().map_or(Ok(100), |s| s.parse())?;
+            passed(chaos::race(&database_url, &client, producers, workers, customers).await?)
+        }
         Some("check") => passed(chaos::check(&client).await?),
         _ => Err(
-            "expected submit <email> [plan], work, each, chaos [seed] [customers] [workers], or check"
+            "expected submit <email> [plan], work, each, chaos [seed] [customers] [workers], \
+             race [producers] [workers] [customers], or check"
                 .into(),
         ),
     }

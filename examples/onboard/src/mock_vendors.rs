@@ -16,9 +16,11 @@ pub const CALLS: [&str; 7] = [
     "slack",
 ];
 
-/// `error` fails before the vendor does anything. `crash` exits the worker and `slow` replies
-/// after the step timeout, both after the vendor commits and before the workflow saves.
-pub const KINDS: [&str; 3] = ["error", "crash", "slow"];
+/// `error` fails before the vendor does anything. The rest act after the vendor commits and
+/// before the workflow saves: `crash` exits the worker, `slow` replies after the step timeout,
+/// and `freeze` stops the worker process with its connection still open, as a hung process
+/// or paused VM would.
+pub const KINDS: [&str; 4] = ["error", "crash", "slow", "freeze"];
 
 /// Which faults fire, from a spec such as "seed=7 latency_ms=100 charge.crash=0.1
 /// email.error=once". A number is the chance the fault fires on each call; `once` fires on
@@ -247,6 +249,12 @@ impl Vendors {
         if self.faults.fires(call, "slow") {
             tracing::warn!("fault {call}.slow: vendor committed; replying in 10s");
             tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+        if self.faults.fires(call, "freeze") {
+            tracing::error!("fault {call}.freeze: vendor committed; freezing this worker");
+            let _ = std::process::Command::new("kill")
+                .args(["-STOP", &std::process::id().to_string()])
+                .status();
         }
     }
 }

@@ -20,7 +20,7 @@ begin
         v_run.retry_delay * power(2, least(v_run.attempt - v_run.released - 1, 30))
     ) * (0.5 + random() / 2);
     update resume.runs
-    set available_at = clock_timestamp() + v_delay, last_error = p_error
+    set available_at = clock_timestamp() + v_delay, leased = false, last_error = p_error
     where id = p_run_id;
     return extract(epoch from v_delay);
 end;

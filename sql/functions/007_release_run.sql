@@ -7,7 +7,7 @@ as $$
 begin
     perform resume.lock_run(p_run_id, p_attempt);
     update resume.runs
-    set released = released + 1, available_at = clock_timestamp()
+    set released = released + 1, available_at = clock_timestamp(), leased = false
     where id = p_run_id;
 end;
 $$;

@@ -1,12 +1,22 @@
--- Returns zero or one run. Commit this claim before executing user code.
+-- Returns zero or one run. Commit this claim before executing user code. `expired` says the
+-- previous attempt's lease expired without it handing the run back, as after a crash.
 -- The lease must outlast one step, since begin_step renews it at the start of each step.
 create or replace function resume.claim_run(
     p_workflow text,
     p_lease_seconds double precision
 )
-returns setof resume.runs
+returns table (
+    id bigint,
+    idempotency_key text,
+    input jsonb,
+    attempt bigint,
+    released integer,
+    max_attempts integer,
+    expired boolean
+)
 language plpgsql
 as $$
+#variable_conflict use_column
 declare
     v_now timestamptz := clock_timestamp();
 begin
@@ -14,9 +24,9 @@ begin
         raise exception 'lease seconds must be positive' using errcode = '22023';
     end if;
 
-    -- Fail runs whose final attempt's lease expired, as after a crash. An attempt that returns
-    -- an error goes through retry_run or fail_run instead. No attempt holds these claims, so this
-    -- cannot go through fail_run. Skip locked runs so a busy worker cannot hold up claims.
+    -- Fail runs whose final attempt's lease expired. An attempt that returns an error goes
+    -- through retry_run or fail_run instead. No attempt holds these claims, so this cannot
+    -- go through fail_run. Skip locked runs so a busy worker cannot hold up claims.
     with exhausted as (
         select r.id
         from resume.runs r
@@ -29,13 +39,13 @@ begin
     )
     update resume.runs r
     set failed_at = clock_timestamp(),
-        last_error = 'the final attempt''s lease expired'
+        last_error = format('attempt %s''s lease expired', r.attempt - r.released)
     from exhausted e
     where r.id = e.id;
 
     return query
     with candidate as (
-        select r.id
+        select r.id, r.leased
         from resume.runs r
         where r.workflow = p_workflow
           and r.completed_at is null
@@ -48,9 +58,14 @@ begin
     )
     update resume.runs r
     set attempt = r.attempt + 1,
-        available_at = clock_timestamp() + make_interval(secs => p_lease_seconds)
+        available_at = clock_timestamp() + make_interval(secs => p_lease_seconds),
+        leased = true,
+        last_error = case when c.leased
+            then format('attempt %s''s lease expired', r.attempt - r.released)
+            else r.last_error end
     from candidate c
     where r.id = c.id
-    returning r.*;
+    returning r.id, r.idempotency_key, r.input, r.attempt, r.released, r.max_attempts,
+              c.leased;
 end;
 $$;

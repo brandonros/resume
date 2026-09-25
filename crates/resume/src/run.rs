@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use tokio_postgres::{Client, GenericClient, Transaction};
+use tracing::Instrument;
 
 use crate::{Result, RunFailed, Stopping};
 
@@ -29,19 +30,23 @@ impl Run {
         idempotency_key: &str,
         action: impl AsyncFnOnce(&Transaction<'_>) -> Result<Value>,
     ) -> Result<Value> {
-        let (tx, existing, _) = self.begin_step(client, idempotency_key).await?;
-        if let Some(output) = existing {
-            tx.commit().await?;
-            tracing::info!("run {} step {idempotency_key}: using saved result", self.id);
-            return Ok(output);
-        }
+        async {
+            let (tx, existing, _) = self.begin_step(client, idempotency_key).await?;
+            if let Some(output) = existing {
+                tx.commit().await?;
+                tracing::info!("using saved result");
+                return Ok(output);
+            }
 
-        tracing::info!("run {} step {idempotency_key}: executing", self.id);
-        let output = self.timed(idempotency_key, action(&tx)).await?;
-        let saved = self.save_step(&tx, idempotency_key, &output).await?;
-        tx.commit().await?;
-        tracing::info!("run {} step {idempotency_key}: committed", self.id);
-        Ok(saved)
+            tracing::info!("executing");
+            let output = self.timed(idempotency_key, action(&tx)).await?;
+            let saved = self.save_step(&tx, idempotency_key, &output).await?;
+            tx.commit().await?;
+            tracing::info!("committed");
+            Ok(saved)
+        }
+        .instrument(step_span(idempotency_key))
+        .await
     }
 
     /// Makes sure an effect exists. `check` looks for it and `action` runs only when `check`
@@ -57,68 +62,76 @@ impl Run {
         check: impl AsyncFnOnce(&mut C, &Transaction<'_>) -> Result<Option<Value>>,
         action: impl AsyncFnOnce(&mut C, &Transaction<'_>) -> Result<Value>,
     ) -> Result<Value> {
-        let (tx, existing, _) = self.begin_step(client, idempotency_key).await?;
-        if let Some(output) = existing {
-            tx.commit().await?;
-            tracing::info!("run {} step {idempotency_key}: using saved result", self.id);
-            return Ok(output);
-        }
+        async {
+            let (tx, existing, _) = self.begin_step(client, idempotency_key).await?;
+            if let Some(output) = existing {
+                tx.commit().await?;
+                tracing::info!("using saved result");
+                return Ok(output);
+            }
 
-        let output = self
-            .timed(idempotency_key, async {
-                match check(&mut *context, &tx).await? {
-                    Some(output) => {
-                        tracing::info!("run {} step {idempotency_key}: already done", self.id);
-                        Ok(output)
+            let output = self
+                .timed(idempotency_key, async {
+                    match check(&mut *context, &tx).await? {
+                        Some(output) => {
+                            tracing::info!("already done");
+                            Ok(output)
+                        }
+                        None => {
+                            tracing::info!("executing");
+                            action(&mut *context, &tx).await
+                        }
                     }
-                    None => {
-                        tracing::info!("run {} step {idempotency_key}: executing", self.id);
-                        action(&mut *context, &tx).await
-                    }
-                }
-            })
-            .await?;
-        let saved = self.save_step(&tx, idempotency_key, &output).await?;
-        tx.commit().await?;
-        tracing::info!("run {} step {idempotency_key}: committed", self.id);
-        Ok(saved)
+                })
+                .await?;
+            let saved = self.save_step(&tx, idempotency_key, &output).await?;
+            tx.commit().await?;
+            tracing::info!("committed");
+            Ok(saved)
+        }
+        .instrument(step_span(idempotency_key))
+        .await
     }
 
     /// For external effects that must not repeat, such as a vendor without idempotency.
     /// The action runs at most once per run. If an attempt dies or times out after starting it
     /// and before saving its result, the outcome is unknown: the run fails instead of calling
-    /// again, and someone must check the vendor.
+    /// again, and someone must check the vendor and call resume.resolve_step.
     pub async fn step_once(
         &self,
         client: &mut Client,
         idempotency_key: &str,
         action: impl AsyncFnOnce() -> Result<Value>,
     ) -> Result<Value> {
-        let (tx, existing, interrupted) = self.begin_step(client, idempotency_key).await?;
-        if let Some(output) = existing {
+        async {
+            let (tx, existing, interrupted) = self.begin_step(client, idempotency_key).await?;
+            if let Some(output) = existing {
+                tx.commit().await?;
+                tracing::info!("using saved result");
+                return Ok(output);
+            }
+
+            if interrupted {
+                let error = RunFailed(format!(
+                    "step {idempotency_key} started in an earlier attempt and its outcome is unknown"
+                ));
+                self.fail_run(&tx, &error.0).await?;
+                tx.commit().await?;
+                return Err(error.into());
+            }
+            // Commit the start before calling, so a later attempt knows the call may have happened.
             tx.commit().await?;
-            tracing::info!("run {} step {idempotency_key}: using saved result", self.id);
-            return Ok(output);
+
+            tracing::info!("executing once");
+            let output = self.timed(idempotency_key, action()).await?;
+
+            // save_step checks the claim itself, so this needs no transaction of its own.
+            let saved = self.save_step(&*client, idempotency_key, &output).await?;
+            tracing::info!("committed");
+            Ok(saved)
         }
-
-        if interrupted {
-            let error = RunFailed(format!(
-                "step {idempotency_key} started in an earlier attempt and its outcome is unknown"
-            ));
-            self.fail_run(&tx, &error.0).await?;
-            tx.commit().await?;
-            return Err(error.into());
-        }
-        // Commit the start before calling, so a later attempt knows the call may have happened.
-        tx.commit().await?;
-
-        tracing::info!("run {} step {idempotency_key}: executing once", self.id);
-        let output = self.timed(idempotency_key, action()).await?;
-
-        // save_step checks the claim itself, so this needs no transaction of its own.
-        let saved = self.save_step(&*client, idempotency_key, &output).await?;
-        tracing::info!("run {} step {idempotency_key}: committed", self.id);
-        Ok(saved)
+        .instrument(step_span(idempotency_key))
+        .await
     }
 
     /// This attempt's number for logs: claims so far, less claims given back.
@@ -205,4 +218,9 @@ impl Run {
         .await?;
         Ok(())
     }
+}
+
+/// Log lines inside a step carry its key, under the worker's run span.
+fn step_span(key: &str) -> tracing::Span {
+    tracing::info_span!("step", key)
 }
