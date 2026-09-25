@@ -1,8 +1,14 @@
 -- For operators: puts a failed run back in the queue with a fresh set of attempts, for example
 -- after fixing what made it fail. Clears the deadline, since the operator now decides when the
--- run is too late. Refuses while a step_once outcome is unknown, since the run would fail again
--- at once; resolve that step with resolve_step instead.
-create or replace function resume.reopen_run(p_run_id bigint)
+-- run is too late. If a step_once action's outcome is unknown, check the vendor, then pass the
+-- step's key and the output the action would have returned, such as the vendor's ID for what
+-- it created; the run continues from there. Without them, this refuses, since the run would
+-- fail again at once.
+create or replace function resume.reopen_run(
+    p_run_id bigint,
+    p_key text default null,
+    p_output jsonb default null
+)
 returns void
 language plpgsql
 as $$
@@ -22,10 +28,24 @@ begin
             p_run_id using errcode = '55000';
     end if;
 
+    if p_key is not null then
+        if p_output is null then
+            raise exception 'pass the output of step %; use ''null'' for JSON null', p_key
+                using errcode = '22023';
+        end if;
+        update resume.steps
+        set completed_at = clock_timestamp(), output = p_output
+        where run_id = p_run_id and key = p_key and completed_at is null;
+        if not found then
+            raise exception 'run % has no step % with an unknown outcome', p_run_id, p_key
+                using errcode = '55000';
+        end if;
+    end if;
+
     select key into v_step from resume.steps
     where run_id = p_run_id and completed_at is null;
     if found then
-        raise exception 'run % step % has an unknown outcome; resolve it with resolve_step',
+        raise exception 'run % step % has an unknown outcome; check the vendor and pass the step''s key and output',
             p_run_id, v_step using errcode = '55000';
     end if;
 

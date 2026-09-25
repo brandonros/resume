@@ -29,7 +29,7 @@ views:
 # For operators: after checking the vendor, record an interrupted step_once step's output and
 # continue the run, e.g. just resolve-step 7 send_welcome_email 42
 resolve-step run key output:
-    echo "select resume.resolve_step(:'run', :'key', :'output')" | psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 \
+    echo "select resume.reopen_run(:'run', :'key', :'output')" | psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 \
         -v run={{quote(run)}} -v key={{quote(key)}} -v output={{quote(output)}}
 
 # For operators: put a failed run back in the queue with fresh attempts.

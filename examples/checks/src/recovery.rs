@@ -275,3 +275,51 @@ pub(super) async fn worker_exhaustion_queues_handler_without_step_output() {
     let (result, ()) = tokio::join!(worker, observer);
     result.unwrap();
 }
+
+pub(super) async fn reopen_resolves_an_unknown_step_once_outcome() {
+    let client = connect().await;
+    let name = workflow("resolve");
+    let run = crate::common::submit(&client, &name).await;
+    let (_, attempt) = claim(&client, &name).await.unwrap();
+    // A step_once start committed without a result, then the attempt failed.
+    client
+        .execute(
+            "select resume.begin_step($1, $2, 'send', 0, 60)",
+            &[&run, &attempt],
+        )
+        .await
+        .unwrap();
+    end_attempt(&client, run, attempt, "worker died", true)
+        .await
+        .unwrap();
+
+    for (key, output) in [
+        (None, None),
+        (Some("send"), None),
+        (Some("other"), Some("1")),
+    ] {
+        let refused = client
+            .execute(
+                "select resume.reopen_run($1, $2, $3::text::jsonb)",
+                &[&run, &key, &output],
+            )
+            .await;
+        assert!(
+            refused.is_err(),
+            "reopened with key {key:?} and output {output:?}"
+        );
+    }
+    client
+        .execute("select resume.reopen_run($1, 'send', '42')", &[&run])
+        .await
+        .unwrap();
+    let (_, next) = claim(&client, &name).await.unwrap();
+    let saved = client
+        .query_one(
+            "select output from resume.begin_step($1, $2, 'send', 0, 60)",
+            &[&run, &next],
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved.get::<_, serde_json::Value>(0), json!(42));
+}

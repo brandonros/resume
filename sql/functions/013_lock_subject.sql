@@ -14,7 +14,8 @@ begin
             p_run_id using errcode = '22023';
     end if;
 
-    perform resume.lock_resource(v_run.subject);
+    -- The same lock as Rust's lock_resource takes for this name.
+    perform pg_advisory_xact_lock(hashtextextended(v_run.subject, 0));
     return not exists (
         select 1 from resume.runs r
         where r.workflow = v_run.workflow and r.subject = v_run.subject and r.id > p_run_id

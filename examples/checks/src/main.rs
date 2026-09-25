@@ -40,6 +40,7 @@ async fn main() {
     check!(recovery::success_retry_and_snooze_do_not_queue_handlers);
     check!(recovery::failed_handler_reopens_with_saved_progress);
     check!(recovery::reserved_handler_keys_cannot_be_submitted);
+    check!(recovery::reopen_resolves_an_unknown_step_once_outcome);
     check!(recovery::worker_exhaustion_queues_handler_without_step_output);
-    println!("All 25 checks passed.");
+    println!("All 26 checks passed.");
 }
