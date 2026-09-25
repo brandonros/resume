@@ -13,14 +13,15 @@ returns table (output jsonb, failed text)
 language plpgsql
 as $$
 declare
+    v_run resume.runs;
     v_step resume.steps;
     v_other text;
     v_failed text;
 begin
-    perform resume.lock_run(p_run_id, p_attempt);
+    v_run := resume.lock_run(p_run_id, p_attempt);
     -- An attempt whose lease expired must not start new work: another worker may claim the
     -- run as soon as this transaction ends.
-    if (select r.available_at <= clock_timestamp() from resume.runs r where r.id = p_run_id) then
+    if v_run.available_at <= clock_timestamp() then
         raise exception 'run % lease expired', p_run_id using errcode = '55000';
     end if;
     update resume.runs r
@@ -46,7 +47,7 @@ begin
         return;
     end if;
 
-    if (select r.deadline_at <= clock_timestamp() from resume.runs r where r.id = p_run_id) then
+    if v_run.deadline_at <= clock_timestamp() then
         v_failed := 'the run passed its deadline';
     elsif v_step.run_id is not null then
         v_failed := format('step %s started in an earlier attempt and its outcome is unknown', p_key);

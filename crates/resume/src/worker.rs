@@ -128,9 +128,9 @@ impl Worker {
                 "run",
                 workflow = %workflow,
                 id = run.id,
-                attempt = run.number()
+                attempt = run.attempts_used
             );
-            let claimed = format!("claimed ({}/{})", run.number(), run.max_attempts);
+            let claimed = format!("claimed ({}/{})", run.attempts_used, run.max_attempts);
             if expired {
                 tracing::warn!(parent: &span, "{claimed}; the previous attempt's lease expired");
             } else {
@@ -170,7 +170,7 @@ impl Worker {
             .lock()
             .await
             .query_opt(
-                "select id, idempotency_key, input, attempt, released, max_attempts, expired
+                "select id, idempotency_key, input, attempt, attempts_used, max_attempts, expired
                  from resume.claim_run($1, $2, $3)",
                 &[&self.workflow, &self.version, &self.lease.as_secs_f64()],
             )
@@ -182,7 +182,7 @@ impl Worker {
                 idempotency_key: row.try_get("idempotency_key")?,
                 input: row.try_get("input")?,
                 attempt: row.try_get("attempt")?,
-                released: row.try_get("released")?,
+                attempts_used: row.try_get("attempts_used")?,
                 max_attempts: row.try_get("max_attempts")?,
                 lease: self.lease,
                 step_timeout: self.step_timeout,
@@ -231,7 +231,7 @@ pub struct Run {
     pub idempotency_key: String,
     pub input: Value,
     attempt: i64,
-    released: i32,
+    attempts_used: i64,
     max_attempts: i32,
     lease: Duration,
     step_timeout: Duration,
@@ -328,10 +328,6 @@ impl Run {
             .query_one("select resume.lock_subject($1)", &[&self.id])
             .await?
             .try_get(0)?)
-    }
-
-    fn number(&self) -> i64 {
-        self.attempt - i64::from(self.released)
     }
 
     /// Rejects nested or concurrent steps rather than waiting for their connection.

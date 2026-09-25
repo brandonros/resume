@@ -13,8 +13,7 @@ declare
     v_run resume.runs;
     v_delay interval;
 begin
-    perform resume.lock_run(p_run_id, p_attempt);
-    select * into v_run from resume.runs where id = p_run_id;
+    v_run := resume.lock_run(p_run_id, p_attempt);
 
     if p_permanent or v_run.attempt - v_run.released >= v_run.max_attempts then
         update resume.runs set failed_at = clock_timestamp(), last_error = p_error

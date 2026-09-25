@@ -279,5 +279,14 @@ pub(super) async fn release_validates_delay_and_zero_releases_immediately() {
         .execute("select resume.release_run($1, $2, 0)", &[&run, &attempt])
         .await
         .unwrap();
-    assert_eq!(claim(&client, &name).await, Some((run, attempt + 1)));
+    let reclaimed = client
+        .query_one(
+            "select id, attempt, attempts_used from resume.claim_run($1, '1', 60)",
+            &[&name],
+        )
+        .await
+        .unwrap();
+    assert_eq!(reclaimed.get::<_, i64>("id"), run);
+    assert_eq!(reclaimed.get::<_, i64>("attempt"), attempt + 1);
+    assert_eq!(reclaimed.get::<_, i64>("attempts_used"), 1);
 }

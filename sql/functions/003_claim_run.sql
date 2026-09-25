@@ -11,7 +11,7 @@ returns table (
     idempotency_key text,
     input jsonb,
     attempt bigint,
-    released integer,
+    attempts_used bigint,
     max_attempts integer,
     expired boolean
 )
@@ -69,7 +69,7 @@ begin
             else r.last_error end
     from candidate c
     where r.id = c.id
-    returning r.id, r.idempotency_key, r.input, r.attempt, r.released, r.max_attempts,
+    returning r.id, r.idempotency_key, r.input, r.attempt, r.attempt - r.released, r.max_attempts,
               c.leased;
 end;
 $$;

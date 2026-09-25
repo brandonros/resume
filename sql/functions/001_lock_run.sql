@@ -1,8 +1,8 @@
--- Locks the run; raises RS002 if this attempt no longer owns an unfinished claim.
+-- Locks and returns the run; raises RS002 if this attempt no longer owns an unfinished claim.
 -- Lease expiry is checked only by begin_step. Once a step holds the row lock, it may
 -- save its result or record failure after expiry because no other worker can reclaim it.
 create or replace function resume.lock_run(p_run_id bigint, p_attempt bigint)
-returns void
+returns resume.runs
 language plpgsql
 as $$
 declare
@@ -21,5 +21,6 @@ begin
         raise exception 'run % claim is no longer valid', p_run_id
             using errcode = 'RS002';
     end if;
+    return v_run;
 end;
 $$;
