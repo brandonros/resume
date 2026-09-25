@@ -1,7 +1,9 @@
 mod mock_vendors;
 
 use mock_vendors::{FAULTS, Vendors};
-use resume::{Producer, Result, Run, Worker, lock_resource};
+use std::time::Duration;
+
+use resume::{Permanent, Producer, Result, Run, Worker, lock_resource, shutdown_signal};
 use serde_json::json;
 use tokio_postgres::{Client, NoTls};
 
@@ -13,14 +15,14 @@ async fn onboard(client: &mut Client, run: &Run, v: &mut Vendors) -> Result<()> 
         .ok_or("email must be a string")?;
     let plan = run.input["plan"].as_str().ok_or("plan must be a string")?;
 
-    // 1. Pure check. Bad input fails every attempt the same way, so the run fails once its
-    //    attempts are used up.
+    // 1. Pure check. Another attempt cannot fix bad input, so the error is permanent and the
+    //    run fails at once.
     run.step(client, "validate", async |_| {
         if !email.contains('@') {
-            return Err(format!("invalid email {email:?}").into());
+            return Err(Permanent(format!("invalid email {email:?}")).into());
         }
         if !matches!(plan, "free" | "pro") {
-            return Err(format!("unknown plan {plan:?}").into());
+            return Err(Permanent(format!("unknown plan {plan:?}")).into());
         }
         Ok(json!(null))
     })
@@ -178,7 +180,7 @@ async fn main() -> Result<()> {
             let plan = args.next().unwrap_or_else(|| "pro".into());
             // One run per email, so onboarding a customer again returns the first run.
             let run = Producer::new(&client, "onboard")
-                .submit(&email, &json!({"email": email, "plan": plan}), 3)
+                .submit(&email, &json!({"email": email, "plan": plan}))
                 .await?;
             let status = if run.created {
                 "submitted"
@@ -197,9 +199,13 @@ async fn main() -> Result<()> {
                 tracing::warn!("injecting fault {fault}");
             }
             let mut vendors = Vendors::new(connect(&database_url).await?, fault);
-            // A short lease, so a retry after a failure or crash comes quickly.
-            Worker::new(client, "onboard", 5)
-                .run(async |client, run| onboard(client, run, &mut vendors).await)
+            // Short limits, so retries and recovery in the demo come quickly.
+            Worker::new(client, "onboard")
+                .lease(Duration::from_secs(5))
+                .step_timeout(Duration::from_secs(3))
+                .run(shutdown_signal(), async |client, run| {
+                    onboard(client, run, &mut vendors).await
+                })
                 .await
         }
         _ => Err("expected submit <email> [plan] or work".into()),

@@ -26,7 +26,7 @@ onboard-schema:
 onboard-submit email plan="pro":
     cargo run -p onboard -- submit {{quote(email)}} {{quote(plan)}}
 
-# fault: crm_crash, charge_unavailable, charge_crash, email_unavailable or email_crash
+# fault: crm_crash, charge_unavailable, charge_crash, charge_slow, email_unavailable or email_crash
 onboard-process fault="":
     FAULT={{quote(fault)}} cargo run -p onboard -- work
 
@@ -36,7 +36,8 @@ onboard-show:
         -c "select r.id, r.idempotency_key as email, r.attempt, \
                 case when r.completed_at is not null then 'completed' \
                      when r.failed_at is not null then 'failed' else 'pending' end as status, \
-                (select count(*) from resume.steps s where s.run_id = r.id) as saved_steps \
+                (select count(*) from resume.steps s where s.run_id = r.id) as saved_steps, \
+                r.last_error \
             from resume.runs r where r.workflow = 'onboard' order by r.id" \
         -c "select * from vendors.charges order by id" \
         -c "select * from vendors.emails order by id"

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use resume::{Producer, Result, Run, Worker};
+use resume::{Producer, Result, RetryPolicy, Run, Worker, shutdown_signal};
 use serde_json::json;
 use tokio_postgres::{Client, NoTls};
 
@@ -71,7 +71,11 @@ async fn main() -> Result<()> {
         Some("submit") => {
             let key = args.next().ok_or("expected submit <key>")?;
             let run = Producer::new(&client, "counter")
-                .submit(&key, &json!({"amount": 1}), 1)
+                .retry(RetryPolicy {
+                    max_attempts: 1,
+                    ..RetryPolicy::default()
+                })
+                .submit(&key, &json!({"amount": 1}))
                 .await?;
             let status = if run.created {
                 "submitted"
@@ -81,7 +85,11 @@ async fn main() -> Result<()> {
             tracing::info!("{status} run {} for key {key}", run.id);
             Ok(())
         }
-        Some("work") | None => Worker::new(client, "counter", 30).run(counter).await,
+        Some("work") | None => {
+            Worker::new(client, "counter")
+                .run(shutdown_signal(), counter)
+                .await
+        }
         _ => Err("expected submit <key> or work".into()),
     }
 }

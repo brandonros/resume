@@ -1,7 +1,7 @@
 mod mock_issuer;
 
 use mock_issuer::MockIssuer;
-use resume::{Producer, Result, Run, Worker};
+use resume::{Producer, Result, Run, Worker, shutdown_signal};
 use serde_json::json;
 use tokio_postgres::{Client, NoTls};
 
@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
                 .ok_or("expected submit <request_id> [attendee]")?;
             let attendee = args.next().unwrap_or_else(|| "Ada".into());
             let run = Producer::new(&client, "tickets")
-                .submit(&request_id, &json!({"attendee": attendee}), 3)
+                .submit(&request_id, &json!({"attendee": attendee}))
                 .await?;
             let status = if run.created {
                 "submitted"
@@ -75,8 +75,10 @@ async fn main() -> Result<()> {
         }
         Some("work") | None => {
             let mut issuer = MockIssuer::new(connect(&database_url).await?);
-            Worker::new(client, "tickets", 30)
-                .run(async |client, run| tickets(client, run, &mut issuer).await)
+            Worker::new(client, "tickets")
+                .run(shutdown_signal(), async |client, run| {
+                    tickets(client, run, &mut issuer).await
+                })
                 .await
         }
         _ => Err("expected submit <request_id> [attendee] or work".into()),

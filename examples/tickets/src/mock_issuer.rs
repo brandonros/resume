@@ -45,7 +45,8 @@ impl MockIssuer {
             tracing::info!(
                 "mock issuer: issued ticket {id} for request {request_id}; committed, delaying reply for 10s"
             );
-            // Kill here: the ticket exists, but the workflow has no saved result.
+            // Kill here with kill -9 or two Ctrl-Cs: the ticket exists, but the workflow has no
+            // saved result. One Ctrl-C lets this step finish, then releases the run.
             tokio::time::sleep(Duration::from_secs(10)).await;
         } else {
             tracing::info!("mock issuer: reusing ticket {id} for request {request_id}");

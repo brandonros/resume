@@ -1,13 +1,17 @@
+use std::time::Duration;
+
 use resume::Result;
 use tokio_postgres::Client;
 
 /// Failures a worker can inject with FAULT. Each fires once per worker process.
 /// `*_unavailable` errors before the vendor does anything. `*_crash` exits the worker
-/// after the vendor commits, before the workflow saves the result.
-pub const FAULTS: [&str; 5] = [
+/// after the vendor commits, before the workflow saves the result. `*_slow` replies after
+/// the vendor commits, but later than the step timeout.
+pub const FAULTS: [&str; 6] = [
     "crm_crash",
     "charge_unavailable",
     "charge_crash",
+    "charge_slow",
     "email_unavailable",
     "email_crash",
 ];
@@ -127,6 +131,7 @@ impl Vendors {
             }
         };
         self.crash("charge_crash");
+        self.slow("charge_slow").await;
         Ok(id)
     }
 
@@ -162,6 +167,13 @@ impl Vendors {
             return Err(format!("{fault}: 503 service unavailable").into());
         }
         Ok(())
+    }
+
+    async fn slow(&mut self, fault: &str) {
+        if self.fault.take_if(|f| *f == fault).is_some() {
+            tracing::warn!("fault {fault}: vendor committed; replying in 10s");
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
     }
 
     fn crash(&mut self, fault: &str) {

@@ -1,14 +1,22 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
 use serde_json::Value;
 use tokio_postgres::{Client, GenericClient, Transaction};
 
-use crate::{Result, RunFailed};
+use crate::{Result, RunFailed, Stopping};
 
 pub struct Run {
     pub id: i64,
     pub idempotency_key: String,
     pub input: Value,
     pub(crate) attempt: i64,
+    pub(crate) released: i32,
     pub(crate) max_attempts: i32,
+    pub(crate) lease: Duration,
+    pub(crate) step_timeout: Duration,
+    pub(crate) stopping: Arc<AtomicBool>,
 }
 
 impl Run {
@@ -29,7 +37,7 @@ impl Run {
         }
 
         tracing::info!("run {} step {idempotency_key}: executing", self.id);
-        let output = action(&tx).await?;
+        let output = self.timed(idempotency_key, action(&tx)).await?;
         let saved = self.save_step(&tx, idempotency_key, &output).await?;
         tx.commit().await?;
         tracing::info!("run {} step {idempotency_key}: committed", self.id);
@@ -56,16 +64,20 @@ impl Run {
             return Ok(output);
         }
 
-        let output = match check(&mut *context, &tx).await? {
-            Some(output) => {
-                tracing::info!("run {} step {idempotency_key}: already done", self.id);
-                output
-            }
-            None => {
-                tracing::info!("run {} step {idempotency_key}: executing", self.id);
-                action(&mut *context, &tx).await?
-            }
-        };
+        let output = self
+            .timed(idempotency_key, async {
+                match check(&mut *context, &tx).await? {
+                    Some(output) => {
+                        tracing::info!("run {} step {idempotency_key}: already done", self.id);
+                        Ok(output)
+                    }
+                    None => {
+                        tracing::info!("run {} step {idempotency_key}: executing", self.id);
+                        action(&mut *context, &tx).await
+                    }
+                }
+            })
+            .await?;
         let saved = self.save_step(&tx, idempotency_key, &output).await?;
         tx.commit().await?;
         tracing::info!("run {} step {idempotency_key}: committed", self.id);
@@ -73,8 +85,8 @@ impl Run {
     }
 
     /// For external effects that must not repeat, such as a vendor without idempotency.
-    /// The action runs at most once per run. If an attempt dies after starting it and
-    /// before saving its result, the outcome is unknown: the run fails instead of calling
+    /// The action runs at most once per run. If an attempt dies or times out after starting it
+    /// and before saving its result, the outcome is unknown: the run fails instead of calling
     /// again, and someone must check the vendor.
     pub async fn step_once(
         &self,
@@ -90,18 +102,18 @@ impl Run {
         }
 
         if !self.start_step(&tx, idempotency_key).await? {
-            self.fail_run(&tx).await?;
-            tx.commit().await?;
-            return Err(RunFailed(format!(
+            let error = RunFailed(format!(
                 "step {idempotency_key} started in an earlier attempt and its outcome is unknown"
-            ))
-            .into());
+            ));
+            self.fail_run(&tx, &error.0).await?;
+            tx.commit().await?;
+            return Err(error.into());
         }
         // Commit the start before calling, so a later attempt knows the call may have happened.
         tx.commit().await?;
 
         tracing::info!("run {} step {idempotency_key}: executing once", self.id);
-        let output = action().await?;
+        let output = self.timed(idempotency_key, action()).await?;
 
         // save_step checks the claim itself, so this needs no transaction of its own.
         let saved = self.save_step(&*client, idempotency_key, &output).await?;
@@ -109,22 +121,41 @@ impl Run {
         Ok(saved)
     }
 
-    /// Starts a transaction holding the run's lock, after checking this attempt owns it.
-    /// Returns the step's saved output if it already completed.
+    /// This attempt's number for logs: claims so far, less claims given back.
+    pub(crate) fn number(&self) -> i64 {
+        self.attempt - i64::from(self.released)
+    }
+
+    /// Starts a transaction holding the run's lock, after checking this attempt owns it, and
+    /// renews the lease. Returns the step's saved output if it already completed.
     async fn begin_step<'c>(
         &self,
         client: &'c mut Client,
         key: &str,
     ) -> Result<(Transaction<'c>, Option<Value>)> {
+        // A stopping worker lets the step in progress finish and starts no more.
+        if self.stopping.load(Ordering::Relaxed) {
+            return Err(Stopping.into());
+        }
         let tx = client.transaction().await?;
         let existing = tx
             .query_one(
-                "select resume.begin_step($1, $2, $3)",
-                &[&self.id, &self.attempt, &key],
+                "select resume.begin_step($1, $2, $3, $4)",
+                &[&self.id, &self.attempt, &key, &self.lease.as_secs_f64()],
             )
             .await?
             .try_get(0)?;
         Ok((tx, existing))
+    }
+
+    /// Fails the step if its action takes longer than the step timeout. Timing out stops the
+    /// wait but cannot undo what the action already did, so the outcome is unknown, as after
+    /// a crash.
+    async fn timed<T>(&self, key: &str, action: impl Future<Output = Result<T>>) -> Result<T> {
+        match tokio::time::timeout(self.step_timeout, action).await {
+            Ok(result) => result,
+            Err(_) => Err(format!("step {key} timed out after {:?}", self.step_timeout).into()),
+        }
     }
 
     async fn start_step(&self, tx: &Transaction<'_>, key: &str) -> Result<bool> {
@@ -147,9 +178,45 @@ impl Run {
             .try_get(0)?)
     }
 
-    async fn fail_run(&self, tx: &Transaction<'_>) -> Result<()> {
-        tx.execute("select resume.fail_run($1, $2)", &[&self.id, &self.attempt])
-            .await?;
+    pub(crate) async fn complete_run(&self, db: &impl GenericClient) -> Result<()> {
+        db.execute(
+            "select resume.complete_run($1, $2)",
+            &[&self.id, &self.attempt],
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn fail_run(&self, db: &impl GenericClient, error: &str) -> Result<()> {
+        db.execute(
+            "select resume.fail_run($1, $2, $3)",
+            &[&self.id, &self.attempt, &error],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Returns the delay before the next attempt, or None if the run failed.
+    pub(crate) async fn fail_attempt(
+        &self,
+        db: &impl GenericClient,
+        error: &str,
+    ) -> Result<Option<f64>> {
+        Ok(db
+            .query_one(
+                "select resume.fail_attempt($1, $2, $3)",
+                &[&self.id, &self.attempt, &error],
+            )
+            .await?
+            .try_get(0)?)
+    }
+
+    pub(crate) async fn release_run(&self, db: &impl GenericClient) -> Result<()> {
+        db.execute(
+            "select resume.release_run($1, $2)",
+            &[&self.id, &self.attempt],
+        )
+        .await?;
         Ok(())
     }
 }

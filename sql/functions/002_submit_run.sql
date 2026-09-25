@@ -4,7 +4,9 @@ create or replace function resume.submit_run(
     p_workflow text,
     p_idempotency_key text,
     p_input jsonb,
-    p_max_attempts integer default 1
+    p_max_attempts integer default 1,
+    p_retry_delay_seconds double precision default 1,
+    p_retry_max_delay_seconds double precision default 60
 )
 returns table (run_id bigint, created boolean)
 language plpgsql
@@ -12,8 +14,14 @@ as $$
 declare
     v_run resume.runs;
 begin
-    insert into resume.runs (workflow, idempotency_key, input, max_attempts)
-    values (p_workflow, p_idempotency_key, p_input, p_max_attempts)
+    insert into resume.runs (
+        workflow, idempotency_key, input, max_attempts, retry_delay, retry_max_delay
+    )
+    values (
+        p_workflow, p_idempotency_key, p_input, p_max_attempts,
+        make_interval(secs => p_retry_delay_seconds),
+        make_interval(secs => p_retry_max_delay_seconds)
+    )
     on conflict (workflow, idempotency_key) do nothing
     returning * into v_run;
 
