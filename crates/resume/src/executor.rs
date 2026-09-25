@@ -1,7 +1,6 @@
-//! Jobs executed by workflow handlers and handles used by callers to observe their outcomes.
+//! Claimed attempts, durable step transactions, and generic resource locks.
 
 use std::collections::HashSet;
-use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Duration;
@@ -11,7 +10,7 @@ use tokio::sync::{Mutex, MutexGuard};
 use tokio_postgres::{Client, Row, Transaction};
 use tracing::Instrument;
 
-use crate::{Permanent, Result, Snooze};
+use crate::{Permanent, Result, RunFailed, Snooze, Stopping};
 
 /// A job supplied by the worker to a workflow handler, with its input and durable steps.
 /// Each instance belongs to one claimed attempt at a workflow run.
@@ -54,6 +53,10 @@ impl Job {
             keys: std::sync::Mutex::default(),
             client,
         })
+    }
+
+    pub(crate) fn attempt(&self) -> i64 {
+        self.attempt
     }
 
     pub(crate) fn attempts_used(&self) -> i64 {
@@ -138,16 +141,6 @@ impl Job {
         }
         .instrument(step_span(key))
         .await
-    }
-
-    /// Whether no newer run of this workflow has the same subject (see `Producer::submit_for`),
-    /// for use in a step. Locks the subject until the step's transaction ends, so a newer run's
-    /// step waits for this one to commit and applies after it.
-    pub async fn is_latest(&self, tx: &Transaction<'_>) -> Result<bool> {
-        Ok(tx
-            .query_one("select resume.lock_subject($1)", &[&self.id])
-            .await?
-            .try_get(0)?)
     }
 
     /// Rejects nested or concurrent steps rather than waiting for their connection.
@@ -241,153 +234,6 @@ impl Job {
             .await?;
         Ok(())
     }
-
-    /// Releases stopped or snoozing runs; records other errors for retry or terminal failure.
-    pub(crate) async fn settle(&self, result: Result<()>) {
-        let error = match result {
-            Ok(()) => {
-                tracing::info!("completed");
-                return;
-            }
-            Err(error) => error,
-        };
-        if claim_lost(&error) {
-            tracing::warn!("stopped: {error}");
-            return;
-        }
-        if error.is::<RunFailed>() {
-            tracing::warn!("failed: {error}; run failed");
-            return;
-        }
-
-        let released = if error.is::<Stopping>() {
-            Some((Duration::ZERO, "released for another worker".to_string()))
-        } else {
-            error.downcast_ref::<Snooze>().map(|Snooze(delay)| {
-                (
-                    *delay,
-                    format!("snoozed for {delay:?} (bounded by the run's deadline)"),
-                )
-            })
-        };
-        let client = self.client.lock().await;
-        if let Some((delay, done)) = released {
-            match client
-                .execute(
-                    "select resume.release_run($1, $2, $3)",
-                    &[&self.id, &self.attempt, &delay.as_secs_f64()],
-                )
-                .await
-            {
-                Ok(_) => tracing::info!("{done}"),
-                Err(e) => {
-                    tracing::warn!("could not release ({e}); it continues after its lease expires")
-                }
-            }
-            return;
-        }
-
-        let permanent = error.is::<Permanent>();
-        let ended = client
-            .query_one(
-                "select resume.end_attempt($1, $2, $3, $4)",
-                &[&self.id, &self.attempt, &error.to_string(), &permanent],
-            )
-            .await
-            .and_then(|row| row.try_get::<_, Option<f64>>(0));
-        match ended {
-            Ok(Some(seconds)) => tracing::warn!("failed: {error}; retry in {seconds:.1}s"),
-            Ok(None) if permanent => tracing::warn!("failed: {error}; permanent; run failed"),
-            Ok(None) => tracing::warn!("failed: {error}; attempt limit reached; run failed"),
-            Err(e) if e.code().is_some_and(|c| c.code() == "RS002") => {
-                tracing::warn!("failed: {error}; not recorded: {e}")
-            }
-            Err(e) => tracing::warn!(
-                "failed: {error}; could not record it ({e}), so it retries after the lease expires"
-            ),
-        }
-    }
-}
-
-/// A handle returned by a producer for observing a job and waiting for its outcome.
-pub struct JobHandle {
-    pub id: i64,
-    /// False when a run with this idempotency key already existed, in any state.
-    pub created: bool,
-}
-
-/// The terminal state observed while waiting. An operator can later reopen a failed job.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum JobOutcome {
-    Completed,
-    Failed { error: Option<String> },
-    Cancelled { error: Option<String> },
-}
-
-impl JobHandle {
-    /// Waits for the job to complete, fail, or be cancelled, polling every 250 ms.
-    /// Retries and snoozes are not terminal outcomes. A separate worker must process the job.
-    /// Commit any submission transaction before waiting, and use a client outside a transaction.
-    ///
-    /// The timeout covers database queries and polling waits. On timeout the error contains
-    /// [`tokio::time::error::Elapsed`]; database errors propagate unchanged, and a missing job
-    /// is an error. Timing out or dropping this future does not cancel the job. This only
-    /// observes recorded state; it does not perform deadline cleanup or wait for failure handlers.
-    ///
-    /// ```no_run
-    /// # async fn example(client: &tokio_postgres::Client) -> resume::Result<()> {
-    /// use std::time::Duration;
-    /// use resume::{JobOutcome, Producer};
-    /// let handle = Producer::new(client, "checkout", "1")
-    ///     .submit("order:42", &serde_json::json!({"order_id": 42}))
-    ///     .await?;
-    /// match handle.wait(client, Duration::from_secs(30)).await? {
-    ///     JobOutcome::Completed => println!("Done"),
-    ///     JobOutcome::Failed { error } => println!("Failed: {error:?}"),
-    ///     JobOutcome::Cancelled { error } => println!("Cancelled: {error:?}"),
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn wait(&self, client: &Client, timeout: Duration) -> Result<JobOutcome> {
-        tokio::time::timeout(timeout, async {
-            loop {
-                let row = client
-                    .query_opt(
-                        "select completed_at is not null as completed,
-                                failed_at is not null as failed,
-                                cancelled_at is not null as cancelled, last_error
-                         from resume.runs where id = $1",
-                        &[&self.id],
-                    )
-                    .await?
-                    .ok_or_else(|| format!("job {} does not exist", self.id))?;
-                if row.try_get::<_, bool>("completed")? {
-                    return Ok(JobOutcome::Completed);
-                }
-                if row.try_get::<_, bool>("cancelled")? {
-                    return Ok(JobOutcome::Cancelled {
-                        error: row.try_get("last_error")?,
-                    });
-                }
-                if row.try_get::<_, bool>("failed")? {
-                    return Ok(JobOutcome::Failed {
-                        error: row.try_get("last_error")?,
-                    });
-                }
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-        })
-        .await?
-    }
-}
-
-/// A lost claim cannot record further progress or errors.
-fn claim_lost(error: &crate::Error) -> bool {
-    error
-        .downcast_ref::<tokio_postgres::Error>()
-        .and_then(tokio_postgres::Error::code)
-        .is_some_and(|code| code.code() == "RS002")
 }
 
 fn step_span(key: &str) -> tracing::Span {
@@ -407,26 +253,3 @@ pub async fn lock_resource(tx: &Transaction<'_>, resource: &str) -> Result<()> {
     .await?;
     Ok(())
 }
-
-/// The run was marked failed, so no later attempt will retry it.
-#[derive(Debug)]
-struct RunFailed(String);
-
-/// The worker is stopping, so the run stops before its next step and is released.
-#[derive(Debug)]
-struct Stopping;
-
-impl fmt::Display for RunFailed {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl fmt::Display for Stopping {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("worker is stopping")
-    }
-}
-
-impl std::error::Error for RunFailed {}
-impl std::error::Error for Stopping {}

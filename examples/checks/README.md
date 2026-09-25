@@ -7,14 +7,14 @@ just check
 ```
 
 This creates a temporary PostgreSQL database, installs the framework schema, runs all
-33 scenarios, and drops the database on exit. An assertion failure or timeout makes
+34 scenarios, and drops the database on exit. An assertion failure or timeout makes
 the command fail. It does not touch your application database.
 
 The scenarios cover:
 
 - Waiting: completion across retries, terminal outcomes, missing jobs, and timeouts during polling and queries.
 - Expiry: bounded cleanup, locked rows, old versions, and claim safety before cleanup.
-- Ownership: expired leases, stale attempts, rollback, and saved-step replay.
+- Ownership: expired leases, stale attempts, rollback, saved-step replay, and shutdown during a step.
 - Executor and policy: retry fencing and budgets, charged-attempt backoff, atomic submissions, and concurrent duplicate validation.
 - Scheduling: delays, absolute timestamps, duplicate submissions, and deadlines.
 - Snooze: released locks, saved progress, retry counts, and deadlines.

@@ -3,7 +3,9 @@ use std::time::{Duration, SystemTime};
 use serde_json::Value;
 use tokio_postgres::GenericClient;
 
-use crate::{JobHandle, Result};
+use crate::Result;
+
+use super::JobHandle;
 
 /// Retry delays double from `delay` up to `max_delay`, then shrink randomly by up to half.
 /// `max_attempts` includes crash recovery but excludes shutdown and snooze releases.

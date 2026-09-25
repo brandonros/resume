@@ -28,6 +28,7 @@ async fn main() {
     check!(ownership::completed_step_replays_its_output);
     check!(ownership::passing_the_deadline_fails_the_run_without_starting_the_step);
     check!(ownership::a_step_key_used_twice_fails_the_run);
+    check!(ownership::shutdown_finishes_current_step_and_releases_saved_progress);
     check!(policy::executor_finish_enforces_ownership_budget_and_deadline);
     check!(policy::retry_policy_uses_charged_attempts_and_caps_backoff);
     check!(policy::submission_is_atomic_and_duplicate_keeps_winning_policy);
@@ -52,5 +53,5 @@ async fn main() {
     check!(recovery::worker_exhaustion_queues_handler_without_step_output);
     check!(waiting::timeout_leaves_job_available_and_wait_observes_completion);
     check!(waiting::wait_reports_failure_cancellation_missing_jobs_and_query_timeout);
-    println!("All 33 checks passed.");
+    println!("All 34 checks passed.");
 }

@@ -1,13 +1,11 @@
-mod job;
-mod producer;
-mod worker;
+mod executor;
+mod workflow;
 
 use std::fmt;
 use std::time::Duration;
 
-pub use job::{Job, JobHandle, JobOutcome, lock_resource};
-pub use producer::{Producer, RetryPolicy};
-pub use worker::{Worker, shutdown_signal};
+pub use executor::{Job, lock_resource};
+pub use workflow::{JobHandle, JobOutcome, Producer, RetryPolicy, Worker, shutdown_signal};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
@@ -37,3 +35,26 @@ impl fmt::Display for Snooze {
 
 impl std::error::Error for Permanent {}
 impl std::error::Error for Snooze {}
+
+/// The run was marked failed, so no later attempt will retry it.
+#[derive(Debug)]
+struct RunFailed(String);
+
+/// The worker is stopping, so the run stops before its next step and is released.
+#[derive(Debug)]
+struct Stopping;
+
+impl fmt::Display for RunFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl fmt::Display for Stopping {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("worker is stopping")
+    }
+}
+
+impl std::error::Error for RunFailed {}
+impl std::error::Error for Stopping {}

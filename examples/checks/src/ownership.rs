@@ -1,10 +1,11 @@
 //! Claim ownership, lease expiry, and step replay. Run with `just check`.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use resume::Worker;
+use resume::{Producer, RetryPolicy, Worker};
 use serde_json::{Value, json};
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 use tokio_postgres::Client;
 
 use crate::common::{
@@ -221,4 +222,111 @@ pub(super) async fn a_step_key_used_twice_fails_the_run() {
     };
     let (result, ()) = tokio::join!(worker, observer);
     result.unwrap();
+}
+
+pub(super) async fn shutdown_finishes_current_step_and_releases_saved_progress() {
+    let client = connect().await;
+    let name = workflow("shutdown-progress");
+    let id = Producer::new(&client, &name, "1")
+        .retry(RetryPolicy {
+            max_attempts: 1,
+            ..RetryPolicy::default()
+        })
+        .submit("key", &json!({}))
+        .await
+        .unwrap()
+        .id;
+    let first_calls = AtomicU32::new(0);
+    let second_calls = AtomicU32::new(0);
+    let started = Notify::new();
+    let stopping = Notify::new();
+    let finish_step = Notify::new();
+    let (stop, shutdown) = oneshot::channel::<()>();
+    let worker = Worker::new(connect().await, &name, "1").run(
+        async {
+            shutdown.await.unwrap();
+            stopping.notify_one();
+        },
+        async |run| {
+            let output = run
+                .step("first", async |_| {
+                    first_calls.fetch_add(1, Ordering::Relaxed);
+                    started.notify_one();
+                    finish_step.notified().await;
+                    Ok(json!(42))
+                })
+                .await?;
+            assert_eq!(output, json!(42));
+            run.step("second", async |_| {
+                second_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(json!(true))
+            })
+            .await?;
+            Ok(())
+        },
+    );
+    let observer = async {
+        started.notified().await;
+        stop.send(()).unwrap();
+        // The worker handles shutdown before yielding back to this observer; the first
+        // action stays pending until the stopping flag has been set.
+        stopping.notified().await;
+        finish_step.notify_one();
+    };
+    let (result, ()) = tokio::join!(worker, observer);
+    result.unwrap();
+
+    assert_eq!(first_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(second_calls.load(Ordering::Relaxed), 0);
+    assert!(
+        run_is(
+            &client,
+            id,
+            "attempt = 1 and attempts_used = 0 and not leased
+             and available_at <= clock_timestamp() and last_error is null
+             and completed_at is null and failed_at is null"
+        )
+        .await
+    );
+    let saved = client
+        .query_one(
+            "select key, output, completed_at is not null from resume.steps where run_id = $1",
+            &[&id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved.get::<_, &str>(0), "first");
+    assert_eq!(saved.get::<_, Value>(1), json!(42));
+    assert!(saved.get::<_, bool>(2));
+
+    let (stop, shutdown) = oneshot::channel::<()>();
+    let worker = Worker::new(connect().await, &name, "1").run(
+        async {
+            let _ = shutdown.await;
+        },
+        async |run| {
+            let output = run
+                .step("first", async |_| {
+                    first_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(json!(0))
+                })
+                .await?;
+            assert_eq!(output, json!(42));
+            run.step("second", async |_| {
+                second_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(json!(true))
+            })
+            .await?;
+            Ok(())
+        },
+    );
+    let observer = async {
+        wait_for(&client, id, "completed_at is not null").await;
+        stop.send(()).unwrap();
+    };
+    let (result, ()) = tokio::join!(worker, observer);
+    result.unwrap();
+    assert_eq!(first_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(second_calls.load(Ordering::Relaxed), 1);
+    assert!(run_is(&client, id, "attempt = 2 and attempts_used = 1").await);
 }
