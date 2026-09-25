@@ -1,6 +1,5 @@
--- Records how a failed attempt ended. Fails the run if the error is permanent or the attempt
--- was its last; otherwise schedules the next attempt and returns the delay in seconds. Returns
--- null when the run failed.
+-- Fails the run for permanent errors or exhausted attempts; otherwise schedules a retry.
+-- Returns the retry delay in seconds, or null on terminal failure.
 create or replace function resume.end_attempt(
     p_run_id bigint,
     p_attempt bigint,

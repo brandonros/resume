@@ -2,9 +2,8 @@ use harness::Rng;
 use resume::Result;
 use tokio_postgres::Client;
 
-/// A stand-in for a cloud provider. It can find VMs and create them, but it cannot create one
-/// only if a team has room, and creating is not idempotent. Its state lives in the cloud schema,
-/// on a connection that belongs to it, not to resume.
+/// Mock cloud with separate lookup and non-idempotent creation calls, and no quota enforcement.
+/// Commits independently of workflow steps, in the cloud schema.
 pub struct Cloud {
     client: Client,
     rng: Rng,

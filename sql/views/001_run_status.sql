@@ -1,7 +1,6 @@
--- Current committed state for operators. A lease describes a claim, not proof that a worker
--- is running. A step's uncommitted progress and lease renewal are not visible here.
--- newer_run_id means another request exists, not that this run skipped any step. Superseded
--- steps and attempt history are not stored, so this view cannot report them as outcomes.
+-- Committed state only: leases do not prove worker liveness, and uncommitted step progress
+-- is invisible. newer_run_id identifies a newer request, not a skipped step; neither skipped
+-- steps nor attempt history are stored.
 create or replace view resume.run_status as
 select
     r.id,

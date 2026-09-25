@@ -1,5 +1,4 @@
-//! Durable waiting through the real worker and SQL claim path. Uses the same scratch database
-//! as ownership.rs; run with `just check`.
+//! Durable waiting through the worker and SQL claim path. Run with `just check`.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;

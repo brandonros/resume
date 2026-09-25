@@ -83,8 +83,7 @@ impl Faults {
     }
 }
 
-/// Stand-ins for external services. Their state lives in the vendors schema, on a connection
-/// that belongs to them, not to resume.
+/// Mock services that commit independently of workflow steps, in the vendors schema.
 pub struct Vendors {
     client: Client,
     faults: Faults,

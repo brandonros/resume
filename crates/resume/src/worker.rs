@@ -1,5 +1,4 @@
-//! The consumer side: a Worker claims runs and executes them, and a Run is the handle workflow
-//! code uses to execute its steps.
+//! Workers claim runs; workflow code executes their saved steps through `Run`.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -77,9 +76,8 @@ impl Worker {
         if self.poll_interval.is_zero() {
             return Err("poll interval must be greater than zero".into());
         }
-        // If this worker hangs or its host disappears mid-step, Postgres ends the step's
-        // transaction, releasing the run's row lock, instead of holding it until the connection
-        // closes. A healthy step finishes within the lease, since the step timeout is shorter.
+        // Bound transaction and statement waits so a hung worker releases the run's row lock.
+        // The shorter step timeout leaves healthy workers time to save and commit.
         let lease_ms = self.lease.as_millis();
         self.client
             .lock()
@@ -126,7 +124,6 @@ impl Worker {
             };
 
             waiting = false;
-            // Every log line about this run, including its steps', carries these fields.
             let span = tracing::info_span!(
                 "run",
                 workflow = %workflow,
@@ -239,9 +236,9 @@ pub struct Run {
     lease: Duration,
     step_timeout: Duration,
     stopping: Arc<AtomicBool>,
-    /// The position the next step will have in this attempt.
+    /// Next step position in this attempt.
     position: AtomicI32,
-    /// The keys of the steps this attempt has started.
+    /// Step keys already used in this attempt.
     keys: std::sync::Mutex<HashSet<String>>,
     client: Arc<Mutex<Client>>,
 }
@@ -333,13 +330,11 @@ impl Run {
             .try_get(0)?)
     }
 
-    /// This attempt's number for logs: claims so far, less claims given back.
     fn number(&self) -> i64 {
         self.attempt - i64::from(self.released)
     }
 
-    /// The connection for a step. It is free unless another step of this run is in progress,
-    /// started inside a step's action or alongside it, as with `join!`.
+    /// Rejects nested or concurrent steps rather than waiting for their connection.
     fn client(&self) -> Result<MutexGuard<'_, Client>> {
         self.client.try_lock().map_err(|_| {
             Permanent(
@@ -396,9 +391,7 @@ impl Run {
         Ok((tx, output))
     }
 
-    /// Fails the step if its action takes longer than the step timeout. Timing out stops the
-    /// wait but cannot undo what the action already did, so the outcome is unknown, as after
-    /// a crash.
+    /// Bounds the action's duration. A timeout cannot undo external effects.
     async fn timed<T>(&self, key: &str, action: impl Future<Output = Result<T>>) -> Result<T> {
         match tokio::time::timeout(self.step_timeout, action).await {
             Ok(result) => result,
@@ -433,9 +426,7 @@ impl Run {
         Ok(())
     }
 
-    /// Records how the attempt ended: a snoozing or stopping worker releases the run, and
-    /// any other error schedules a retry after a backoff, or fails the run if the error is
-    /// permanent or the attempt was its last.
+    /// Releases stopped or snoozing runs; records other errors for retry or terminal failure.
     async fn settle(&self, result: Result<()>) {
         let error = match result {
             Ok(()) => {
@@ -502,8 +493,7 @@ impl Run {
     }
 }
 
-/// Whether this attempt no longer owns the run: it was cancelled or reclaimed after its lease
-/// expired, so there is nothing left to record.
+/// A lost claim cannot record further progress or errors.
 fn claim_lost(error: &crate::Error) -> bool {
     error
         .downcast_ref::<tokio_postgres::Error>()
@@ -511,7 +501,6 @@ fn claim_lost(error: &crate::Error) -> bool {
         .is_some_and(|code| code.code() == "RS002")
 }
 
-/// Log lines inside a step carry its key, under the worker's run span.
 fn step_span(key: &str) -> tracing::Span {
     tracing::info_span!("step", key)
 }

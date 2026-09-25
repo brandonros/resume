@@ -4,7 +4,6 @@ use mock_issuer::MockIssuer;
 use resume::{Producer, Result, Run, Worker, shutdown_signal};
 use serde_json::json;
 
-/// The version of this workflow's input and steps; producers and workers must agree.
 pub const VERSION: &str = "1";
 
 async fn tickets(run: &Run, issuer: &mut MockIssuer) -> Result<()> {

@@ -1,9 +1,7 @@
--- Starts a step: locks the run, checks this attempt still holds its claim, renews the lease,
--- and records the start. Returns the output if the step already completed. Fails the run, and
--- returns the reason in `failed`, if it is past its deadline or an earlier attempt started this
--- step without completing it, so a step_once action's outcome is unknown; the caller commits
--- that. Raises with SQLSTATE RS001 if the step's position differs from when the run first
--- reached it. Call it first in the step's transaction, so the lock covers the rest of the step.
+-- Call first in the step transaction to lock the run, validate ownership, and renew its lease.
+-- Returns saved output on replay. A missed deadline or an unresolved step_once start fails
+-- the run and returns `failed`; the caller must commit that failure.
+-- A changed step position raises RS001.
 create or replace function resume.begin_step(
     p_run_id bigint,
     p_attempt bigint,

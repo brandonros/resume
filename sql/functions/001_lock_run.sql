@@ -1,8 +1,6 @@
--- Locks the run and raises with SQLSTATE RS002 unless this attempt still owns it: no later claim
--- replaced it, it has not handed the run back, and the run has not finished. Every function that
--- changes a claimed run calls this first. It does not check the lease: once a step's transaction
--- holds this lock, no one can claim the run, so an attempt may save a step or record how it ended
--- even after its lease ran out. Only starting a step needs a live lease; see begin_step.
+-- Locks the run; raises RS002 if this attempt no longer owns an unfinished claim.
+-- Lease expiry is checked only by begin_step. Once a step holds the row lock, it may
+-- save its result or record failure after expiry because no other worker can reclaim it.
 create or replace function resume.lock_run(p_run_id bigint, p_attempt bigint)
 returns void
 language plpgsql

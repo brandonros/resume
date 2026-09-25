@@ -5,10 +5,8 @@ use tokio_postgres::GenericClient;
 
 use crate::Result;
 
-/// How a run retries after a failed attempt. The first retry waits `delay`, and each later one
-/// waits twice as long as the last, up to `max_delay`, less a random part of up to half.
-/// `max_attempts` counts claims, including recovery after a crash, but excludes claims
-/// released for shutdown or snoozing.
+/// Retry delays double from `delay` up to `max_delay`, then shrink randomly by up to half.
+/// `max_attempts` includes crash recovery but excludes shutdown and snooze releases.
 #[derive(Clone, Copy, Debug)]
 pub struct RetryPolicy {
     pub max_attempts: i32,
@@ -33,7 +31,6 @@ pub struct Producer<'a, C: GenericClient> {
     retry: RetryPolicy,
     deadline: Option<Duration>,
     start: Start,
-    /// The failure handler's workflow and version.
     on_failure: Option<(String, String)>,
 }
 

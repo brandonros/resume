@@ -1,5 +1,4 @@
-//! Ownership rules of the SQL functions: which attempt may start steps, save them, and record
-//! how it ended. Needs a database with the resume schema in DATABASE_URL; `just check` creates one.
+//! Claim ownership, lease expiry, and step replay. Run with `just check`.
 
 use std::time::Duration;
 

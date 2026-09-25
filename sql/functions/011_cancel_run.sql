@@ -1,6 +1,5 @@
--- For operators: stops a run that has not finished. A waiting run is never claimed again, and
--- a run in progress stops at its next step, because lock_run rejects failed runs. The step in
--- progress, if any, finishes first: this waits for its lock.
+-- Cancels an unfinished run. Waits for any step holding the row lock to finish;
+-- subsequent steps and claims are rejected.
 create or replace function resume.cancel_run(p_run_id bigint)
 returns void
 language plpgsql

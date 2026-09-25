@@ -205,10 +205,8 @@ pub async fn random(client: &Client, seed: u64, customers: usize, workers: usize
     Ok(harness::verify(client, "onboard", INVARIANTS, &pool.logs).await? && !duplicate_run)
 }
 
-/// Starts `workers` workers, then has `producers` producers, each on its own connection, all
-/// submit every one of `customers` at once, in different orders. No faults, only a little
-/// vendor latency to widen race windows. Checks that each key created exactly one run, then the
-/// history and the invariants.
+/// Submits every customer from concurrent producers in different orders while workers run.
+/// Uses vendor latency but no faults; checks one run per key, history, and invariants.
 pub async fn race(
     database_url: &str,
     client: &Client,

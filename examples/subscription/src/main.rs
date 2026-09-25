@@ -8,7 +8,6 @@ use resume::{Producer, Result, RetryPolicy, Run, Worker, lock_resource, shutdown
 use serde_json::{Value, json};
 use tokio_postgres::{Client, Transaction};
 
-/// The version of this workflow's input and steps; producers and workers must agree.
 pub const VERSION: &str = "1";
 
 const PLANS: [&str; 3] = ["free", "pro", "team"];
@@ -16,9 +15,8 @@ const LEASE: Duration = Duration::from_secs(5);
 const STEP_TIMEOUT: Duration = Duration::from_secs(3);
 const INVARIANTS: &str = include_str!("../invariants.sql");
 
-/// Sets a customer's plan at billing and in our record, skipping it if a newer request for the
-/// customer replaced this one. `PLAIN=1` leaves out the is_latest check, to show the stale
-/// plans it prevents.
+/// Applies the latest requested plan. `PLAIN=1` omits `is_latest`, allowing stale requests
+/// to overwrite newer plans.
 async fn change_plan(run: &Run, billing: &mut Billing, plain: bool) -> Result<()> {
     let customer_id = run.input["customer_id"]
         .as_i64()
@@ -61,9 +59,8 @@ async fn set_plan(
     Ok(json!(plan))
 }
 
-/// Plays the customers: each asks for a new plan `changes` times, one request after another,
-/// while `workers` workers apply them with billing latency and errors. Then checks that every
-/// customer ends on the plan they asked for last.
+/// Changes plans while workers apply them under billing latency and errors, then checks
+/// that each customer's final plan matches their latest request.
 async fn race(
     client: &Client,
     customers: i64,

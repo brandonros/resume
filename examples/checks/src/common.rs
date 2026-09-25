@@ -1,5 +1,4 @@
-//! Helpers the scenarios share. Each scenario uses workflows of its own, so they cannot see
-//! each other's runs.
+//! Shared scenario helpers. Unique workflow names isolate each scenario's runs.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;

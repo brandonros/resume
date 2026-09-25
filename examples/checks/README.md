@@ -17,7 +17,11 @@ The scenarios cover:
 - Snooze: released locks, saved progress, retry counts, and deadlines.
 - Failure handlers: atomic dispatch, terminal failure paths, saved cleanup progress, and lost results.
 
-The runner calls ordinary async Rust functions; there is no separate test harness.
-To use your own **disposable database** with the core schema installed, run
-`DATABASE_URL=... cargo run -p checks`. Each scenario uses workflows of its own, and scratch
-tables go in a `checks` schema, so the checks can run again on the same database.
+To run against an existing **disposable database** with the core schema installed:
+
+```sh
+DATABASE_URL=... cargo run -p checks
+```
+
+Each scenario uses unique workflow names and scratch tables in the `checks` schema,
+so checks can be rerun on the same database.

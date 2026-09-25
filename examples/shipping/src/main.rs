@@ -8,15 +8,13 @@ use resume::{Producer, Result, Run, Worker, shutdown_signal};
 use serde_json::{Value, json};
 use tokio_postgres::{Client, Transaction};
 
-/// The version of this workflow's input and steps; producers and workers must agree.
 pub const VERSION: &str = "1";
 const LEASE: Duration = Duration::from_secs(5);
 const STEP_TIMEOUT: Duration = Duration::from_secs(3);
 const INVARIANTS: &str = include_str!("../invariants.sql");
 
-/// Ships an order if it is still paid, checking and shipping in one step. `SEPARATE=1` checks
-/// in one step and ships in the next, to show what a check made apart from its action lets
-/// through.
+/// Checks payment and ships under one lock. `SEPARATE=1` splits them into two steps,
+/// allowing a cancellation between the check and shipment.
 async fn ship_order(run: &Run, warehouse: &mut Warehouse, separate: bool) -> Result<()> {
     let order_id = run.input["order_id"]
         .as_i64()

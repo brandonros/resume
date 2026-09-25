@@ -2,8 +2,8 @@ use harness::Rng;
 use resume::Result;
 use tokio_postgres::Client;
 
-/// A stand-in for a warehouse that ships whatever it is asked to. Its state lives in the
-/// warehouse schema, on a connection that belongs to it, not to resume.
+/// Mock warehouse that ships without checking order status.
+/// Commits independently of workflow steps, in the warehouse schema.
 pub struct Warehouse {
     client: Client,
     rng: Rng,

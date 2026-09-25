@@ -8,7 +8,6 @@ use mock_vendors::{Faults, Vendors};
 use resume::{Permanent, Producer, Result, Run, Worker, lock_resource, shutdown_signal};
 use serde_json::json;
 
-/// The version of this workflow's input and steps; producers and workers must agree.
 pub const VERSION: &str = "1";
 
 const SETUP_FEE_CENTS: i64 = 5000;
@@ -23,8 +22,7 @@ async fn onboard(run: &Run, v: &mut Vendors) -> Result<()> {
         .ok_or("email must be a string")?;
     let plan = run.input["plan"].as_str().ok_or("plan must be a string")?;
 
-    // 1. Pure check. Another attempt cannot fix bad input, so the error is permanent and the
-    //    run fails at once.
+    // Invalid input cannot be fixed by retrying.
     run.step("validate", async |_| {
         if !email.contains('@') {
             return Err(Permanent(format!("invalid email {email:?}")).into());
@@ -36,7 +34,7 @@ async fn onboard(run: &Run, v: &mut Vendors) -> Result<()> {
     })
     .await?;
 
-    // 2. Our own database. The insert commits with the step's result: exactly once.
+    // The insert and step result commit together.
     let customer_id = run
         .step("create_customer", async |tx| {
             let row = tx
@@ -51,10 +49,8 @@ async fn onboard(run: &Run, v: &mut Vendors) -> Result<()> {
         .as_i64()
         .ok_or("customer ID must be an integer")?;
 
-    // 3. A vendor we can search but that has no idempotency key: find the contact or create
-    //    it. A retry after a crash finds the contact instead of creating a second one. The
-    //    lock stops another run or workflow for this customer from checking at the same time
-    //    and creating a duplicate.
+    // Lookup recovers a contact created before a crash. Lock across lookup and creation
+    // to prevent concurrent runs from creating duplicates.
     let crm_contact_id = run
         .step("ensure_crm_contact", async |tx| {
             lock_resource(tx, &format!("crm_contact:{customer_id}")).await?;
@@ -65,8 +61,7 @@ async fn onboard(run: &Run, v: &mut Vendors) -> Result<()> {
         })
         .await?;
 
-    // 4. A vendor that accepts idempotency keys needs no check: the key names the customer, so
-    //    every retry gets the same billing customer back.
+    // The vendor returns the same customer for every retry of this key.
     let billing_customer_id = run
         .step("ensure_billing_customer", async |_| {
             Ok(json!(
@@ -76,8 +71,7 @@ async fn onboard(run: &Run, v: &mut Vendors) -> Result<()> {
         })
         .await?;
 
-    // 5. Decide what this run needs to do. Saving the answer keeps every attempt on the same
-    //    branches, even if the customer's state changes in between.
+    // Save branch decisions so retries follow the same steps even if customer state changes.
     let need = run
         .step("decide", async |tx| {
             let row = tx
@@ -93,8 +87,7 @@ async fn onboard(run: &Run, v: &mut Vendors) -> Result<()> {
         })
         .await?;
 
-    // 6. Ask billing whether the fee was already charged, and charge it only if not. After a
-    //    crash between the charge and the commit, the retry finds the charge.
+    // Lookup recovers a charge made before a crash.
     let setup_fee_key = format!("setup_fee:{customer_id}");
     let setup_fee_charge_id = if need["setup_fee"] == true {
         run.step("ensure_setup_fee", async |_| {
@@ -114,8 +107,8 @@ async fn onboard(run: &Run, v: &mut Vendors) -> Result<()> {
         json!(null)
     };
 
-    // 7. The email vendor has no key and no lookup, so the send runs at most once. If an
-    //    attempt stops after starting it, the run fails and someone must check the outbox.
+    // With no vendor key or lookup, send at most once. An interrupted send requires
+    // an operator to check the outbox.
     let welcomed = need["welcome"] == true;
     if welcomed {
         run.step_once("send_welcome_email", async || {
@@ -124,7 +117,6 @@ async fn onboard(run: &Run, v: &mut Vendors) -> Result<()> {
         .await?;
     }
 
-    // 8. Record what the vendors hold in our own database, in one transaction.
     run.step("link_customer", async |tx| {
         tx.execute(
             "update onboard.customers
@@ -144,7 +136,7 @@ async fn onboard(run: &Run, v: &mut Vendors) -> Result<()> {
     })
     .await?;
 
-    // 9. A duplicate message is harmless, so a plain step is enough: at least once.
+    // Duplicate notifications are harmless, so this step may repeat.
     run.step("notify_slack", async |_| {
         v.post_slack(&format!("onboarded {email} on {plan}"))
             .await?;

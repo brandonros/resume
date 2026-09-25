@@ -9,15 +9,13 @@ create table resume.runs (
     -- The record this run changes, such as 'customer:42'. Run::is_latest says whether a newer
     -- run of the workflow has the same subject.
     subject text check (subject <> ''),
-    -- The workflow version the producer submitted the run for. Only workers of that version
-    -- claim it, so its input and its steps come from the same code.
+    -- Only workers of this version may claim the run.
     version text not null check (version <> ''),
     -- If set, the run fails once this passes, whether it is waiting or in progress.
     deadline_at timestamptz,
     -- Increases with every claim and identifies which claim owns the run.
     attempt bigint not null default 0 check (attempt >= 0),
-    -- Claims that do not count against max_attempts: those a stopping or snoozing worker gave
-    -- back, and every claim before an operator reopened the run.
+    -- Claims excluded from max_attempts: shutdown, snooze, and claims before reopening.
     released integer not null default 0 check (released >= 0),
     max_attempts integer not null default 1 check (max_attempts > 0),
     -- The wait after a failed attempt starts at retry_delay and doubles, up to retry_max_delay.
@@ -26,8 +24,7 @@ create table resume.runs (
     -- Next time this run may be claimed. While claimed, this is when the lease expires;
     -- each step renews it.
     available_at timestamptz not null default clock_timestamp(),
-    -- Set by a claim and cleared when the attempt hands the run back. A claim that finds it
-    -- still set knows the previous attempt's lease expired, as after a crash.
+    -- Set on claim, cleared on release. Remains set after a crash to detect expired attempts.
     leased boolean not null default false,
     completed_at timestamptz,
     failed_at timestamptz,

@@ -1,7 +1,6 @@
--- Returns zero or one run submitted for this workflow version. Commit this claim before
--- executing user code. `expired` says the previous attempt's lease expired without
--- it handing the run back, as after a crash.
--- The lease must outlast one step, since begin_step renews it at the start of each step.
+-- Claims at most one run for this workflow version. Commit before executing user code.
+-- `expired` means the previous attempt's lease expired without release.
+-- The lease must outlast one step; begin_step renews it before each action.
 create or replace function resume.claim_run(
     p_workflow text,
     p_version text,
@@ -26,11 +25,9 @@ begin
         raise exception 'lease seconds must be positive' using errcode = '22023';
     end if;
 
-    -- Fail waiting runs past their deadline, and runs whose final attempt's lease expired. An
-    -- attempt that returns an error goes through end_attempt instead. No attempt
-    -- holds these claims, so this cannot go through end_attempt. Skip locked runs so a busy
-    -- worker cannot hold up claims, and take a bounded batch so a backlog, and the handler
-    -- runs it queues, cannot make one claim slow; later claims take the rest.
+    -- Sweep missed deadlines and expired final attempts without an owning worker.
+    -- Skip active locks and bound the batch, including the failure handlers it queues,
+    -- so cleanup cannot hold up claims. Later calls sweep the rest.
     with ended as (
         select r.id, r.deadline_at <= v_now as past_deadline
         from resume.runs r

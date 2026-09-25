@@ -1,6 +1,5 @@
--- For Run::is_latest: locks the run's subject until the calling transaction ends, then returns
--- whether the run is still the newest of its workflow for that subject. Holding the lock through
--- the step means a newer run's step waits for this one to commit, so it applies after it.
+-- Locks the subject for the transaction and returns whether this is its newest workflow run.
+-- Hold through the step so newer runs apply their changes after this one commits.
 create or replace function resume.lock_subject(p_run_id bigint)
 returns boolean
 language plpgsql

@@ -1,5 +1,4 @@
-//! Test harness shared by the examples: setup, worker processes to kill, stop and freeze, and
-//! checks of the workers' logs and of a workflow's invariants.
+//! Shared example setup, worker process control, and invariant checks.
 
 mod rng;
 
@@ -23,8 +22,7 @@ pub fn init() -> Result<String> {
     Ok(std::env::var("DATABASE_URL").map_err(|_| "set DATABASE_URL")?)
 }
 
-/// Like `init`, and connects to DATABASE_URL. Returns the URL too, for workers and vendors
-/// that need connections of their own.
+/// Initializes logging and connects to DATABASE_URL, returning both the URL and connection.
 pub async fn start() -> Result<(String, Client)> {
     let url = init()?;
     let client = connect(&url).await?;
@@ -52,7 +50,7 @@ where
     }
 }
 
-/// Turns whether every check held into the process's result.
+/// Returns an error if any invariant failed.
 pub fn passed(held: bool) -> Result<()> {
     if held {
         Ok(())
@@ -180,8 +178,7 @@ impl Pool {
         }
     }
 
-    /// Thaws and stops every worker, including ones that froze themselves, then waits for
-    /// them to exit.
+    /// Thaws and stops all workers, killing any still running after 15 seconds.
     pub async fn stop(&mut self) {
         for worker in &mut self.workers {
             worker.frozen_until = None;
@@ -227,8 +224,7 @@ pub fn log_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// Checks the workers' logs, across every attempt of every run: no step committed twice, which
-/// would mean two attempts both owned the run, and no step_once action started twice.
+/// Checks logs for duplicate step commits and repeated `step_once` actions across attempts.
 pub fn check_history(dir: &Path) -> Result<bool> {
     let mut counts: HashMap<(String, String, String), usize> = HashMap::new();
     for log in log_files(dir)? {
@@ -262,8 +258,7 @@ fn step_event(line: &str) -> Option<(&str, &str, &str)> {
     Some((run, key, message))
 }
 
-/// Runs a query that returns one row per violated invariant, and prints each. Returns whether
-/// they all hold.
+/// Prints each violation returned by the query; returns true when there are none.
 pub async fn check_invariants(client: &Client, workflow: &str, invariants: &str) -> Result<bool> {
     let row = client
         .query_one(

@@ -1,9 +1,7 @@
--- For operators: puts a failed run back in the queue with a fresh set of attempts, for example
--- after fixing what made it fail. Clears the deadline, since the operator now decides when the
--- run is too late. If a step_once action's outcome is unknown, check the vendor, then pass the
--- step's key and the output the action would have returned, such as the vendor's ID for what
--- it created; the run continues from there. Without them, this refuses, since the run would
--- fail again at once.
+-- Requeues a failed run with fresh attempts and no deadline. Runs that dispatched a failure
+-- handler cannot reopen; reopen the handler instead.
+-- For an unresolved step_once action, check the vendor and supply the step key and output.
+-- Reopening without resolving that outcome is rejected.
 create or replace function resume.reopen_run(
     p_run_id bigint,
     p_key text default null,

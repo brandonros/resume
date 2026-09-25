@@ -1,7 +1,7 @@
 # Cleanup in a failure handler
 
-Checkout charges a payment, reserves inventory, then fails shipping. One ordinary failure
-workflow releases inventory, refunds payment, and records a notification, using three saved steps.
+Checkout charges a payment, reserves inventory, then fails shipping. Its failure handler
+releases inventory, refunds payment, and records a notification in three saved steps.
 
 ```rust
 Producer::new(&client, "checkout", VERSION)
@@ -28,7 +28,8 @@ just checkout-process  # exits with code 99
 just checkout-process  # resumes after the three-second lease expires
 ```
 
-Release's saved step is replayed. Refund is safely repeated, then notification runs.
+The handler reuses the saved release result, repeats the idempotent refund, then records
+the notification.
 
 The framework queues the handler in the same transaction that fails the original run,
 including exhausted retries, deadlines, and cancellation. Ordinary retries and snoozes do

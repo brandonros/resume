@@ -10,7 +10,6 @@ use resume::{
 use serde_json::json;
 use tokio_postgres::Client;
 
-/// The version of this workflow's input and steps; producers and workers must agree.
 pub const VERSION: &str = "1";
 
 /// VMs each team may have.
@@ -23,10 +22,8 @@ async fn provision(run: &Run, cloud: &mut Cloud, locked: bool) -> Result<()> {
     let team = run.input["team"].as_str().ok_or("team must be a string")?;
     let request_id = &run.idempotency_key;
 
-    // 1. Create a VM unless this request already has one or the team is at its quota. Counting
-    //    and creating are separate calls to the cloud, so two requests for the same team could
-    //    both see room and both create. The lock makes them take turns until this step
-    //    commits, by which time the new VM is visible to the next request's count.
+    // Hold the team lock across the cloud's separate count and create calls, so concurrent
+    // requests cannot both see room and exceed the quota.
     let vm = run
         .step("ensure_vm", async |tx| {
             if locked {
@@ -45,7 +42,6 @@ async fn provision(run: &Run, cloud: &mut Cloud, locked: bool) -> Result<()> {
         })
         .await?;
 
-    // 2. Record the sandbox in our own database.
     run.step("record_sandbox", async |tx| {
         tx.execute(
             "insert into provision.sandboxes (request_id, team, vm_id) values ($1, $2, $3)",
@@ -97,7 +93,6 @@ async fn race(
         LIMIT,
         Duration::from_millis(100),
         async || {
-            // Replace workers that crashed.
             pool.reap();
             while pool.workers.len() < workers {
                 let seed = (pool.spawned + 1).to_string();

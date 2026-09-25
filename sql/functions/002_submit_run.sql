@@ -1,7 +1,6 @@
--- Returns the run for this key, creating it if needed. A key maps to one run for good,
--- even after that run fails, so a step_once action cannot repeat through a new run. Keys
--- starting with 'resume:' are reserved for runs resume creates, such as failure handlers.
--- Parameters after p_input have defaults, so SQL callers can name only what they set.
+-- Returns the existing run for this key or creates one. Keys remain bound to failed runs,
+-- preventing step_once actions from repeating through resubmission. The 'resume:' prefix
+-- is reserved for framework runs. Parameters after p_input are optional.
 create or replace function resume.submit_run(
     p_workflow text,
     p_version text,

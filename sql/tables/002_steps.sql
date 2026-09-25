@@ -1,10 +1,7 @@
--- A step's progress within a run. begin_step inserts the row in the step's transaction, so a
--- failed step leaves nothing behind, except step_once, which commits the start before calling
--- out. A row with no completed_at therefore means a step_once action may have run and its
--- outcome is unknown. A completed step's output never changes.
--- The key is unique within the run and must be stable across attempts; it may be dynamic.
--- position is the order in which the run reached the step; a replay that reaches it at another
--- position means the workflow's code changed, and the run fails instead of going on.
+-- Normal steps commit their row with their result. step_once commits the start first,
+-- so an incomplete row may represent an action with an unknown outcome.
+-- Completed outputs are immutable. Keys must remain unique within a run and stable across
+-- attempts; changing a step's position on replay fails the run.
 create table resume.steps (
     run_id bigint not null references resume.runs (id) on delete cascade,
     key text not null check (key <> ''),

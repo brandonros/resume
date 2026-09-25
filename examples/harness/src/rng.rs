@@ -1,5 +1,4 @@
-/// A small seeded random number generator (SplitMix64), so a fault plan or chaos run can be
-/// replayed from its seed.
+/// Seeded SplitMix64 generator for reproducible fault plans and chaos runs.
 pub struct Rng(u64);
 
 impl Rng {
