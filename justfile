@@ -3,7 +3,7 @@ export DATABASE_URL := server + "/resume"
 export PATH := "/Users/brandon/Applications/Postgres.app/Contents/Versions/18/bin:" + env("PATH")
 
 # Drops and recreates the resume database with every schema.
-reset: && schema counter-schema onboard-schema provision-schema shipping-schema subscription-schema tickets-schema
+reset: && schema counter-schema exports-schema onboard-schema provision-schema reminders-schema shipping-schema subscription-schema tickets-schema
     dropdb --if-exists --force --maintenance-db "{{server}}/postgres" resume
     createdb --maintenance-db "{{server}}/postgres" resume
 
@@ -124,3 +124,39 @@ tickets-submit request_id attendee="Ada":
 
 tickets-process:
     cargo run -p tickets -- work
+
+exports-schema:
+    psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction -f examples/exports/001_exports.sql
+
+# The mock vendor becomes ready after ready_after seconds; unfinished checks snooze for 2s.
+exports-submit key ready_after="10":
+    cargo run -p exports -- submit {{quote(key)}} {{quote(ready_after)}}
+
+exports-process:
+    cargo run -p exports -- work
+
+exports-show:
+    psql "$DATABASE_URL" -X \
+        -c "select id, idempotency_key, status, attempt, attempts_used, steps_completed, last_error \
+            from resume.run_status where workflow = 'exports' order by id" \
+        -c "select * from exports.results order by run_id"
+
+reminders-schema:
+    psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction -f examples/reminders/001_reminders.sql
+
+# The run is inserted now and stays unclaimed until the delay has passed.
+reminders-submit key delay="10" message="Time to stretch":
+    cargo run -p reminders -- submit {{quote(key)}} {{quote(delay)}} {{quote(message)}}
+
+# One-time scheduling at an ISO 8601 timestamp with Z or an explicit UTC offset.
+reminders-submit-at key timestamp message="Time to stretch":
+    cargo run -p reminders -- submit-at {{quote(key)}} {{quote(timestamp)}} {{quote(message)}}
+
+reminders-process:
+    cargo run -p reminders -- work
+
+reminders-show:
+    psql "$DATABASE_URL" -X \
+        -c "select id, idempotency_key, status, attempt, available_at, last_error \
+            from resume.run_status where workflow = 'reminders' order by id" \
+        -c "select * from reminders.deliveries order by delivered_at"

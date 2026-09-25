@@ -1,5 +1,6 @@
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tokio_postgres::GenericClient;
 
@@ -32,6 +33,8 @@ pub struct Producer<'a, C: GenericClient> {
     version: String,
     retry: RetryPolicy,
     deadline: Option<Duration>,
+    delay: Duration,
+    at: Option<SystemTime>,
 }
 
 pub struct Submitted {
@@ -51,6 +54,8 @@ impl<'a, C: GenericClient> Producer<'a, C> {
             version: version.into(),
             retry: RetryPolicy::default(),
             deadline: None,
+            delay: Duration::ZERO,
+            at: None,
         }
     }
 
@@ -67,8 +72,41 @@ impl<'a, C: GenericClient> Producer<'a, C> {
         self
     }
 
+    /// Insert runs now, but wait at least this long from submission before workers may claim
+    /// them. Defaults to zero. Applies to both `submit` and `submit_for`; submitting an existing
+    /// key again keeps its original schedule. A deadline still counts from submission, so a
+    /// run whose deadline comes first fails without executing. Replaces any earlier `at` call.
+    pub fn delay(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self.at = None;
+        self
+    }
+
+    /// Insert runs now, eligible at this timestamp. Accepts a UTC datetime; parsing an ISO
+    /// 8601 / RFC 3339 string with `Z` or a UTC offset converts it to UTC. Past times are eligible
+    /// immediately. Actual execution depends on worker availability.
+    ///
+    /// Applies to `submit` and `submit_for`. Replaces any earlier `delay` call; submitting an
+    /// existing key keeps its original schedule. Deadlines still count from submission.
+    ///
+    /// ```no_run
+    /// # async fn example(client: &tokio_postgres::Client) -> resume::Result<()> {
+    /// resume::Producer::new(client, "reminders", "1")
+    ///     .at("2026-09-26T00:00:00-04:00".parse()?)
+    ///     .submit("reminder:42", &serde_json::json!({"message": "Time to stretch"}))
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn at(mut self, at: DateTime<Utc>) -> Self {
+        self.at = Some(at.into());
+        self.delay = Duration::ZERO;
+        self
+    }
+
     /// Returns the run for `idempotency_key`, creating it if needed. Reusing a key with
-    /// different input is an error. The retry policy only applies when the run is created.
+    /// different input is an error. The retry policy, schedule and deadline only apply when the
+    /// run is created.
     pub async fn submit(&self, idempotency_key: &str, input: &Value) -> Result<Submitted> {
         self.submit_run(idempotency_key, input, None).await
     }
@@ -93,7 +131,7 @@ impl<'a, C: GenericClient> Producer<'a, C> {
         let row = self
             .client
             .query_one(
-                "select run_id, created from resume.submit_run($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                "select run_id, created from resume.submit_run($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
                 &[
                     &self.workflow,
                     &self.version,
@@ -104,6 +142,8 @@ impl<'a, C: GenericClient> Producer<'a, C> {
                     &self.retry.max_delay.as_secs_f64(),
                     &subject,
                     &self.deadline.map(|d| d.as_secs_f64()),
+                    &self.delay.as_secs_f64(),
+                    &self.at,
                 ],
             )
             .await?;

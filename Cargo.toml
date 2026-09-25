@@ -2,9 +2,11 @@
 members = [
     "crates/resume",
     "examples/counter",
+    "examples/exports",
     "examples/harness",
     "examples/onboard",
     "examples/provision",
+    "examples/reminders",
     "examples/shipping",
     "examples/subscription",
     "examples/tickets",

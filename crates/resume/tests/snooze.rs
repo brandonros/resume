@@ -351,7 +351,7 @@ async fn step_once_cannot_snooze_and_repeat_its_action() {
 }
 
 #[tokio::test]
-async fn release_validates_delay_and_keeps_immediate_release_available() {
+async fn release_validates_delay_and_zero_releases_immediately() {
     let client = connect().await;
     let name = workflow("release");
     let run = Producer::new(&client, &name, "1")
@@ -384,7 +384,7 @@ async fn release_validates_delay_and_keeps_immediate_release_available() {
         assert_eq!(error.as_db_error().unwrap().code().code(), "22023");
     }
     client
-        .execute("select resume.release_run($1, $2)", &[&run, &attempt])
+        .execute("select resume.release_run($1, $2, 0)", &[&run, &attempt])
         .await
         .unwrap();
     let next: i64 = client

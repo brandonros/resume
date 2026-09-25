@@ -22,7 +22,7 @@ async fn claim(client: &Client, lease_seconds: f64) -> (i64, i64, String) {
     let workflow = format!("test-{}-{n}", std::process::id());
     client
         .execute(
-            "select resume.submit_run($1, '1', 'key', '{}', 3)",
+            "select resume.submit_run($1, '1', 'key', '{}', 3, 1, 60, null, null, 0, null)",
             &[&workflow],
         )
         .await

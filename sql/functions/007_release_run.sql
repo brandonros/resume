@@ -23,11 +23,3 @@ begin
     where id = p_run_id;
 end;
 $$;
-
--- Preserve the immediate-release call used when a worker stops.
-create or replace function resume.release_run(p_run_id bigint, p_attempt bigint)
-returns void
-language sql
-as $$
-    select resume.release_run(p_run_id, p_attempt, 0::double precision);
-$$;

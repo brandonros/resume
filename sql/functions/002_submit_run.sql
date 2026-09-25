@@ -5,27 +5,40 @@ create or replace function resume.submit_run(
     p_version text,
     p_idempotency_key text,
     p_input jsonb,
-    p_max_attempts integer default 1,
-    p_retry_delay_seconds double precision default 1,
-    p_retry_max_delay_seconds double precision default 60,
-    p_subject text default null,
-    p_deadline_seconds double precision default null
+    p_max_attempts integer,
+    p_retry_delay_seconds double precision,
+    p_retry_max_delay_seconds double precision,
+    p_subject text,
+    p_deadline_seconds double precision,
+    p_delay_seconds double precision,
+    p_at timestamptz
 )
 returns table (run_id bigint, created boolean)
 language plpgsql
 as $$
 declare
     v_run resume.runs;
+    v_now timestamptz := clock_timestamp();
+    v_deadline_at timestamptz := v_now + make_interval(secs => p_deadline_seconds);
 begin
+    if p_delay_seconds is null or p_delay_seconds < 0
+       or p_delay_seconds >= 'Infinity'::double precision then
+        raise exception 'submit delay seconds must be finite and nonnegative' using errcode = '22023';
+    end if;
+    if p_at is not null and (not isfinite(p_at) or p_delay_seconds <> 0) then
+        raise exception 'submit at must be finite and cannot be combined with a delay' using errcode = '22023';
+    end if;
     insert into resume.runs (
         workflow, version, idempotency_key, input, subject, max_attempts, retry_delay, retry_max_delay,
-        deadline_at
+        deadline_at, available_at
     )
     values (
         p_workflow, p_version, p_idempotency_key, p_input, p_subject, p_max_attempts,
         make_interval(secs => p_retry_delay_seconds),
         make_interval(secs => p_retry_max_delay_seconds),
-        clock_timestamp() + make_interval(secs => p_deadline_seconds)
+        v_deadline_at,
+        -- Wake for an earlier deadline so the claim sweep can fail the run on time.
+        least(coalesce(p_at, v_now + make_interval(secs => p_delay_seconds)), v_deadline_at)
     )
     on conflict (workflow, idempotency_key) do nothing
     returning * into v_run;
