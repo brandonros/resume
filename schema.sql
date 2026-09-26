@@ -6,6 +6,9 @@ create table resume.jobs (
     key text not null check (key <> ''),
     input jsonb not null,
     attempt bigint not null default 0,
+    retries bigint not null check (retries between 0 and 4294967295),
+    retry_delay_seconds double precision not null
+        check (retry_delay_seconds >= 0 and retry_delay_seconds < 'Infinity'::double precision),
     leased boolean not null default false,
     available_at timestamptz not null default clock_timestamp(),
     completed boolean not null default false,
@@ -22,14 +25,15 @@ create table resume.steps (
     primary key (job_id, key)
 );
 
--- The no-op update locks a duplicate and validates its input atomically.
-create function resume.submit(p_workflow text, p_key text, p_input jsonb)
+-- The no-op update validates duplicate input and preserves the original retry settings.
+create function resume.submit(p_workflow text, p_key text, p_input jsonb, p_retries bigint default 0,
+    p_retry_delay_seconds double precision default 0)
 returns bigint language plpgsql as $$
 declare
     v_id bigint;
 begin
-    insert into resume.jobs (workflow, key, input)
-    values (p_workflow, p_key, p_input)
+    insert into resume.jobs (workflow, key, input, retries, retry_delay_seconds)
+    values (p_workflow, p_key, p_input, p_retries, p_retry_delay_seconds)
     on conflict (workflow, key) do update set key = excluded.key
         where jobs.input = excluded.input
     returning id into v_id;
@@ -46,6 +50,7 @@ returns setof resume.jobs language sql as $$
     with candidate as (
         select id from resume.jobs
         where workflow = p_workflow and not completed and available_at <= clock_timestamp()
+            and attempt <= retries
         order by available_at, id
         limit 1 for update skip locked
     )
@@ -71,13 +76,13 @@ begin
 end;
 $$;
 
--- Success is terminal; failure releases the job with a fixed one-second delay.
+-- Failure releases the job with its submitted delay; claims enforce the retry limit.
 create function resume.finish(p_id bigint, p_attempt bigint, p_error text)
 returns void language plpgsql as $$
 begin
     update resume.jobs
     set completed = p_error is null, leased = false, last_error = p_error,
-        available_at = clock_timestamp() + interval '1 second'
+        available_at = clock_timestamp() + make_interval(secs => retry_delay_seconds)
     where id = p_id and attempt = p_attempt and leased and not completed
         and available_at > clock_timestamp();
     if not found then

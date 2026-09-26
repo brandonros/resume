@@ -18,7 +18,15 @@ async fn main() -> Result<()> {
             "create table if not exists greetings (job_id bigint primary key, name text)",
         )
         .await?;
-    submit(&client, "greet", "ada", &json!({"name": "Ada"})).await?;
+    submit(
+        &client,
+        "greet",
+        "ada",
+        &json!({"name": "Ada"}),
+        3,
+        Duration::from_secs(1),
+    )
+    .await?;
     loop {
         let result = run_one(&mut client, "greet", async |job, steps| {
             steps

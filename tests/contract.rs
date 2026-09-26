@@ -30,19 +30,29 @@ async fn submission_is_atomic_and_idempotent() -> Result<()> {
     let b = connect().await;
     let input = json!({"amount": 10});
     let (first, duplicate) = tokio::join!(
-        submit(&a, "submit", "key", &input),
-        submit(&b, "submit", "key", &input),
+        submit(&a, "submit", "key", &input, 3, Duration::from_secs(1)),
+        submit(&b, "submit", "key", &input, 3, Duration::from_secs(1)),
     );
     let id = first?;
     assert_eq!(id, duplicate?);
     assert!(
-        submit(&a, "submit", "key", &json!({"amount": 11}))
-            .await
-            .is_err()
+        submit(
+            &a,
+            "submit",
+            "key",
+            &json!({"amount": 11}),
+            3,
+            Duration::from_secs(1)
+        )
+        .await
+        .is_err()
     );
-    assert_ne!(id, submit(&a, "another", "key", &input).await?);
+    assert_ne!(
+        id,
+        submit(&a, "another", "key", &input, 3, Duration::from_secs(1)).await?
+    );
     let tx = a.transaction().await?;
-    let rolled_back = submit(&tx, "submit", "rollback", &input).await?;
+    let rolled_back = submit(&tx, "submit", "rollback", &input, 3, Duration::from_secs(1)).await?;
     tx.rollback().await?;
     assert!(
         a.query_opt("select id from resume.jobs where id = $1", &[&rolled_back])
@@ -59,7 +69,15 @@ async fn failure_rolls_back_and_retry_replays_saved_output() -> Result<()> {
     client
         .batch_execute("create table effects (job bigint, step integer, primary key (job, step))")
         .await?;
-    let id = submit(&client, "replay", "key", &json!(null)).await?;
+    let id = submit(
+        &client,
+        "replay",
+        "key",
+        &json!(null),
+        3,
+        Duration::from_secs(1),
+    )
+    .await?;
     let result = run_one(&mut client, "replay", async |job, steps| {
         steps
             .step("first", async |tx| {
@@ -111,7 +129,18 @@ async fn failure_rolls_back_and_retry_replays_saved_output() -> Result<()> {
         })
         .await?
     );
-    assert_eq!(id, submit(&client, "replay", "key", &json!(null)).await?);
+    assert_eq!(
+        id,
+        submit(
+            &client,
+            "replay",
+            "key",
+            &json!(null),
+            3,
+            Duration::from_secs(1)
+        )
+        .await?
+    );
     assert!(
         !run_one(&mut client, "replay", async |_, _| panic!(
             "reclaimed a completed job"
@@ -126,7 +155,15 @@ async fn failure_rolls_back_and_retry_replays_saved_output() -> Result<()> {
 async fn abandoned_claims_are_reclaimed_and_stale_tokens_are_rejected() -> Result<()> {
     let a = connect().await;
     let b = connect().await;
-    let id = submit(&a, "fencing", "key", &json!(null)).await?;
+    let id = submit(
+        &a,
+        "fencing",
+        "key",
+        &json!(null),
+        3,
+        Duration::from_secs(1),
+    )
+    .await?;
     let (one, two) = tokio::join!(
         a.query_opt("select attempt from resume.claim('fencing')", &[]),
         b.query_opt("select attempt from resume.claim('fencing')", &[]),
@@ -174,7 +211,7 @@ async fn abandoned_claims_are_reclaimed_and_stale_tokens_are_rejected() -> Resul
 async fn a_step_lock_prevents_reclaim_after_the_visible_lease_expires() -> Result<()> {
     let mut a = connect().await;
     let b = connect().await;
-    let id = submit(&a, "locked", "key", &json!(null)).await?;
+    let id = submit(&a, "locked", "key", &json!(null), 3, Duration::from_secs(1)).await?;
     let (_, attempt) = claim(&a, "locked").await;
     a.execute("update resume.jobs set available_at = clock_timestamp() + interval '1 second' where id = $1", &[&id]).await?;
     let tx = a.transaction().await?;
@@ -204,7 +241,15 @@ async fn dropping_a_handler_keeps_saved_progress_for_recovery() -> Result<()> {
     client
         .batch_execute("create table dropped_effects (job bigint)")
         .await?;
-    let id = submit(&client, "dropped", "key", &json!(null)).await?;
+    let id = submit(
+        &client,
+        "dropped",
+        "key",
+        &json!(null),
+        3,
+        Duration::from_secs(1),
+    )
+    .await?;
     let (sent, received) = tokio::sync::oneshot::channel();
     {
         let work = run_one(&mut client, "dropped", async |job, steps| {
@@ -252,7 +297,15 @@ async fn dropping_a_handler_keeps_saved_progress_for_recovery() -> Result<()> {
 #[ignore = "requires a disposable database with schema.sql installed"]
 async fn duplicate_step_keys_release_the_attempt_with_an_error() -> Result<()> {
     let mut client = connect().await;
-    let id = submit(&client, "keys", "key", &json!(null)).await?;
+    let id = submit(
+        &client,
+        "keys",
+        "key",
+        &json!(null),
+        3,
+        Duration::from_secs(1),
+    )
+    .await?;
     let result = run_one(&mut client, "keys", async |_, steps| {
         steps.step("same", async |_| Ok(json!(1))).await?;
         steps
@@ -271,5 +324,159 @@ async fn duplicate_step_keys_release_the_attempt_with_an_error() -> Result<()> {
             .await?
             .get::<_, bool>(0)
     );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable database with schema.sql installed"]
+async fn retry_limits_cover_errors_crashes_and_duplicate_submissions() -> Result<()> {
+    let mut client = connect().await;
+    for retries in [0u32, 2] {
+        for crashed in [false, true] {
+            let workflow = format!("budget-{retries}-{crashed}");
+            let id = submit(
+                &client,
+                &workflow,
+                "key",
+                &json!(null),
+                retries,
+                Duration::from_secs(1),
+            )
+            .await?;
+            for expected in 1..=i64::from(retries) + 1 {
+                if crashed {
+                    let (_, attempt) = claim(&client, &workflow).await;
+                    assert_eq!(attempt, expected);
+                } else {
+                    let error =
+                        run_one(
+                            &mut client,
+                            &workflow,
+                            async |_, _| Err("broken job".into()),
+                        )
+                        .await
+                        .unwrap_err();
+                    assert_eq!(error.to_string(), "broken job");
+                }
+                due(&client, id).await;
+            }
+            // Duplicates cannot restart exhausted jobs or increase their original budget.
+            assert_eq!(
+                id,
+                submit(
+                    &client,
+                    &workflow,
+                    "key",
+                    &json!(null),
+                    100,
+                    Duration::from_secs(1)
+                )
+                .await?
+            );
+            assert!(
+                !run_one(&mut client, &workflow, async |_, _| panic!(
+                    "exceeded retry limit"
+                ))
+                .await?
+            );
+            let row = client
+                .query_one(
+                    "select attempt, retries, completed from resume.jobs where id = $1",
+                    &[&id],
+                )
+                .await?;
+            assert_eq!(row.get::<_, i64>(0), i64::from(retries) + 1);
+            assert_eq!(row.get::<_, i64>(1), i64::from(retries));
+            assert!(!row.get::<_, bool>(2));
+        }
+    }
+    // Zero retries still permits a successful initial attempt.
+    submit(
+        &client,
+        "budget-success",
+        "key",
+        &json!(null),
+        0,
+        Duration::from_secs(1),
+    )
+    .await?;
+    assert!(run_one(&mut client, "budget-success", async |_, _| Ok(())).await?);
+    assert!(
+        client
+            .execute(
+                "select resume.submit('invalid-budget', 'key', 'null', -1)",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable database with schema.sql installed"]
+async fn submitted_delays_are_preserved_and_zero_retries_immediately() -> Result<()> {
+    let mut client = connect().await;
+    let id = submit(
+        &client,
+        "delayed",
+        "key",
+        &json!(null),
+        1,
+        Duration::from_millis(30_500),
+    )
+    .await?;
+    assert_eq!(
+        id,
+        submit(&client, "delayed", "key", &json!(null), 9, Duration::ZERO).await?
+    );
+    // Submission itself is immediately eligible; the delay applies after failure.
+    let (_, attempt) = claim(&client, "delayed").await;
+    client
+        .execute("select resume.finish($1, $2, 'failed')", &[&id, &attempt])
+        .await?;
+    let row = client
+        .query_one(
+            "select retries, retry_delay_seconds,
+         available_at > clock_timestamp() + interval '29 seconds'
+         and available_at <= clock_timestamp() + interval '30.5 seconds'
+         from resume.jobs where id = $1",
+            &[&id],
+        )
+        .await?;
+    assert_eq!(row.get::<_, i64>(0), 1);
+    assert_eq!(row.get::<_, f64>(1), 30.5);
+    assert!(row.get::<_, bool>(2));
+    assert!(
+        !run_one(&mut client, "delayed", async |_, _| panic!(
+            "retried too soon"
+        ))
+        .await?
+    );
+
+    submit(&client, "immediate", "key", &json!(null), 1, Duration::ZERO).await?;
+    assert!(
+        run_one(&mut client, "immediate", async |_, _| Err("failed".into()))
+            .await
+            .is_err()
+    );
+    assert!(run_one(&mut client, "immediate", async |_, _| Ok(())).await?);
+    for delay in [
+        None,
+        Some(-1.0),
+        Some(f64::INFINITY),
+        Some(f64::NEG_INFINITY),
+        Some(f64::NAN),
+    ] {
+        assert!(
+            client
+                .query_one(
+                    "select resume.submit('invalid-delay', 'key', 'null', 1, $1)",
+                    &[&delay]
+                )
+                .await
+                .is_err()
+        );
+    }
     Ok(())
 }

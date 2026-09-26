@@ -15,24 +15,36 @@ pub struct Job {
 }
 
 /// Submit with a client or transaction. Submission commits with the caller's transaction.
+/// `retries` is the number of additional attempts: zero means one attempt total.
+/// `retry_delay` is the wait after a reported failure; zero permits immediate retry.
+/// Crashes consume attempts too and recover at lease expiry. Duplicate submissions keep
+/// the original retry count and delay.
 pub async fn submit(
     db: &impl GenericClient,
     workflow: &str,
     key: &str,
     input: &Value,
+    retries: u32,
+    retry_delay: Duration,
 ) -> Result<i64> {
     Ok(db
         .query_one(
-            "select resume.submit($1, $2, $3)",
-            &[&workflow, &key, input],
+            "select resume.submit($1, $2, $3, $4, $5)",
+            &[
+                &workflow,
+                &key,
+                input,
+                &i64::from(retries),
+                &retry_delay.as_secs_f64(),
+            ],
         )
         .await?
         .try_get(0)?)
 }
 
 /// Process at most one job; return false when none is ready, true on completion.
-/// Handler errors release the job for retry and are returned to the caller.
-/// Database failures propagate; an unreleased job recovers after its lease expires.
+/// Handler errors release the job and are returned; retries stop when its budget is spent.
+/// Database failures propagate; abandoned jobs can retry after lease expiry if budget remains.
 ///
 /// Use a dedicated client: this sets its statement and idle-transaction timeouts to
 /// 60 seconds. Step actions have a 30-second timeout and must yield to the runtime.
