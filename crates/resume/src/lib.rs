@@ -1,3 +1,4 @@
+mod error;
 mod executor;
 mod workflow;
 
@@ -11,6 +12,7 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Fails the run without retrying, for errors such as invalid input.
+/// Contextual wrappers must expose this error through `std::error::Error::source`.
 #[derive(Debug)]
 pub struct Permanent(pub String);
 
@@ -18,6 +20,7 @@ pub struct Permanent(pub String);
 /// Propagate with `?` before a readiness check completes: that step's database changes roll
 /// back, completed steps stay saved, and the unfinished step runs on the next claim.
 /// A `step_once` action cannot snooze because it must not run again.
+/// Contextual wrappers must expose this error through `std::error::Error::source`.
 #[derive(Debug)]
 pub struct Snooze(pub Duration);
 

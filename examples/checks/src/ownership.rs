@@ -261,7 +261,8 @@ pub(super) async fn shutdown_finishes_current_step_and_releases_saved_progress()
                 second_calls.fetch_add(1, Ordering::Relaxed);
                 Ok(json!(true))
             })
-            .await?;
+            .await
+            .map_err(crate::errors::context)?;
             Ok(())
         },
     );

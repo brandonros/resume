@@ -1,5 +1,6 @@
 //! Runnable regression scenarios against a fresh PostgreSQL database. Run with `just check`.
 mod common;
+mod errors;
 mod expiry;
 mod ownership;
 mod policy;
@@ -31,6 +32,9 @@ async fn main() {
     check!(ownership::passing_the_deadline_fails_the_run_without_starting_the_step);
     check!(ownership::a_step_key_used_twice_fails_the_run);
     check!(ownership::shutdown_finishes_current_step_and_releases_saved_progress);
+    check!(errors::wrapped_errors_preserve_failure_and_snooze_policy);
+    check!(errors::nonretryable_claim_error_stops_the_worker);
+    check!(errors::transient_claim_error_retries_then_processes_work);
     check!(policy::executor_finish_enforces_ownership_budget_and_deadline);
     check!(policy::retry_policy_uses_charged_attempts_and_caps_backoff);
     check!(policy::submission_is_atomic_and_duplicate_keeps_winning_policy);

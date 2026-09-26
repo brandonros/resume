@@ -9,8 +9,9 @@ use tokio::sync::Mutex;
 use tokio_postgres::Client;
 use tracing::Instrument;
 
+use crate::Result;
+use crate::error::{ErrorKind, classify};
 use crate::executor::Job;
-use crate::{Permanent, Result, RunFailed, Snooze, Stopping};
 
 pub struct Worker {
     /// Shared with the claimed run, which uses it for its steps.
@@ -61,8 +62,17 @@ impl Worker {
         self
     }
 
-    /// Claims and executes runs until `shutdown` resolves. The run in progress then finishes
-    /// its current step and is released, so another worker continues it at once.
+    /// Claims and executes runs until `shutdown` resolves. Once shutdown is observed, the
+    /// current step finishes and the next step stops the run so another worker can continue
+    /// it at once. A handler that finishes its last step can still complete the run.
+    /// Shutdown is cooperative: the handler must propagate step errors with `?` and return.
+    /// Put I/O and external effects inside `step` or `step_once`; waits between steps have
+    /// no timeout and can delay shutdown indefinitely. Step timeouts require actions to yield
+    /// to the async runtime; synchronous blocking work must not block the runtime thread.
+    ///
+    /// Claim queries retry serialization failures, deadlocks, lock unavailability, and query
+    /// cancellation after the poll interval. Other claim errors and closed connections are
+    /// returned to the caller, including schema and permission errors.
     pub async fn run(
         self,
         shutdown: impl Future<Output = ()>,
@@ -103,11 +113,11 @@ impl Worker {
             let claimed = match self.claim_run(&stopping).await {
                 Ok(claimed) => claimed,
                 Err(error) if self.client.lock().await.is_closed() => return Err(error),
-                // A transient error, such as a statement timeout: try again after the interval.
-                Err(error) => {
+                Err(error) if classify(error.as_ref()) == ErrorKind::TransientDatabase => {
                     tracing::warn!("{workflow}: could not claim ({error}); trying again");
                     None
                 }
+                Err(error) => return Err(error),
             };
             let Some((run, expired)) = claimed else {
                 if !waiting {
@@ -170,24 +180,24 @@ impl Worker {
             }
             Err(error) => error,
         };
-        if claim_lost(&error) {
-            tracing::warn!("stopped: {error}");
-            return;
-        }
-        if error.is::<RunFailed>() {
-            tracing::warn!("failed: {error}; run failed");
-            return;
-        }
-
-        let released = if error.is::<Stopping>() {
-            Some((Duration::ZERO, "released for another worker".to_string()))
-        } else {
-            error.downcast_ref::<Snooze>().map(|Snooze(delay)| {
-                (
-                    *delay,
-                    format!("snoozed for {delay:?} (bounded by the run's deadline)"),
-                )
-            })
+        let kind = classify(error.as_ref());
+        let released = match kind {
+            ErrorKind::ClaimLost => {
+                tracing::warn!("stopped: {error}");
+                return;
+            }
+            ErrorKind::RunFailed => {
+                tracing::warn!("failed: {error}; run failed");
+                return;
+            }
+            ErrorKind::Stopping => {
+                Some((Duration::ZERO, "released for another worker".to_string()))
+            }
+            ErrorKind::Snooze(delay) => Some((
+                delay,
+                format!("snoozed for {delay:?} (bounded by the run's deadline)"),
+            )),
+            _ => None,
         };
         let client = self.client.lock().await;
         if let Some((delay, done)) = released {
@@ -206,7 +216,7 @@ impl Worker {
             return;
         }
 
-        let permanent = error.is::<Permanent>();
+        let permanent = kind == ErrorKind::Permanent;
         let ended = client
             .query_one(
                 "select resume.fail_attempt($1, $2, $3, $4)",
@@ -218,7 +228,7 @@ impl Worker {
             Ok(Some(seconds)) => tracing::warn!("failed: {error}; retry in {seconds:.1}s"),
             Ok(None) if permanent => tracing::warn!("failed: {error}; permanent; run failed"),
             Ok(None) => tracing::warn!("failed: {error}; attempt limit reached; run failed"),
-            Err(e) if e.code().is_some_and(|c| c.code() == "RS002") => {
+            Err(e) if classify(&e) == ErrorKind::ClaimLost => {
                 tracing::warn!("failed: {error}; not recorded: {e}")
             }
             Err(e) => tracing::warn!(
@@ -282,12 +292,4 @@ pub async fn shutdown_signal() {
         tracing::warn!("interrupted again; exiting now");
         std::process::exit(130);
     });
-}
-
-/// A lost claim cannot record further progress or errors.
-fn claim_lost(error: &crate::Error) -> bool {
-    error
-        .downcast_ref::<tokio_postgres::Error>()
-        .and_then(tokio_postgres::Error::code)
-        .is_some_and(|code| code.code() == "RS002")
 }

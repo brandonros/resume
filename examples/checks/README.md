@@ -15,6 +15,7 @@ The scenarios cover:
 - Waiting: completion across retries, terminal outcomes, missing jobs, and timeouts during polling and queries.
 - Expiry: bounded cleanup, locked rows, old versions, and claim safety before cleanup.
 - Ownership: expired leases, stale attempts, rollback, saved-step replay, and shutdown during a step.
+- Errors: contextual wrappers preserve permanent failure and snooze policy; configuration errors stop claiming, while lock timeouts retry.
 - Executor and policy: retry fencing and budgets, charged-attempt backoff, atomic submissions, and concurrent duplicate validation.
 - Scheduling: delays, absolute timestamps, duplicate submissions, and deadlines.
 - Snooze: released locks, saved progress, retry counts, and deadlines.

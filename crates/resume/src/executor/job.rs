@@ -1,5 +1,3 @@
-//! Claimed attempts, durable step transactions, and generic resource locks.
-
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -10,7 +8,8 @@ use tokio::sync::{Mutex, MutexGuard};
 use tokio_postgres::{Client, Row, Transaction};
 use tracing::Instrument;
 
-use crate::{Permanent, Result, RunFailed, Snooze, Stopping};
+use crate::error::{ErrorKind, classify};
+use crate::{Permanent, Result, RunFailed, Stopping};
 
 /// A job supplied by the worker to a workflow handler, with its input and durable steps.
 /// Each instance belongs to one claimed attempt at a workflow run.
@@ -129,7 +128,7 @@ impl Job {
                 .timed(key, action())
                 .await
                 .map_err(|error| -> crate::Error {
-                    let hint = if error.is::<Snooze>() {
+                    let hint = if matches!(classify(error.as_ref()), ErrorKind::Snooze(_)) {
                         "; use a regular step for readiness checks"
                     } else {
                         ""
@@ -255,18 +254,4 @@ fn permanent_if_workflow_changed(error: tokio_postgres::Error) -> crate::Error {
 
 fn step_span(key: &str) -> tracing::Span {
     tracing::info_span!("step", key)
-}
-
-/// Locks `resource` (for example "customer:42") until the step's transaction ends, so steps
-/// naming the same resource run one at a time, even across runs and workflows. A crashed
-/// worker's lock is released when its connection closes. Take it before checking state, so
-/// the check and the action it guards happen under the same lock. Names are hashed to 64 bits,
-/// so two names sharing a lock is possible but very unlikely.
-pub async fn lock_resource(tx: &Transaction<'_>, resource: &str) -> Result<()> {
-    tx.execute(
-        "select pg_advisory_xact_lock(hashtextextended($1, 0))",
-        &[&resource],
-    )
-    .await?;
-    Ok(())
 }
