@@ -1328,3 +1328,240 @@ async fn wait_for_rejects_jobs_that_are_not_children() -> Result<()> {
     assert!(db_message(&error).contains("is not a child"));
     Ok(())
 }
+
+// Observe an actual database lock wait before releasing the competing transaction.
+async fn wait_until_blocked(observer: &Client, pid: i32) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let blocked: bool = observer
+                .query_one("select cardinality(pg_blocking_pids($1)) > 0", &[&pid])
+                .await?
+                .get(0);
+            if blocked {
+                return Ok::<_, resume::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable database with schema.sql installed"]
+async fn parent_wait_and_child_completion_cannot_lose_a_wakeup() -> Result<()> {
+    let mut parent_db = connect().await;
+    let mut child_db = connect().await;
+    let observer = connect().await;
+    let parent_pid: i32 = parent_db
+        .query_one("select pg_backend_pid()", &[])
+        .await?
+        .get(0);
+    let child_pid: i32 = child_db
+        .query_one("select pg_backend_pid()", &[])
+        .await?
+        .get(0);
+    for parent_first in [true, false] {
+        let workflow = format!("wakeup-race-{parent_first}");
+        let child_workflow = format!("{workflow}-child");
+        let parent = submit(&parent_db, &workflow, "parent", &json!(null)).await?;
+        let child: i64 = parent_db
+            .query_one(
+                "select resume.submit($1, 'child', 'null', p_parent_id => $2)",
+                &[&child_workflow, &parent],
+            )
+            .await?
+            .get(0);
+        let (_, mut parent_attempt) = claim(&parent_db, &workflow).await;
+        let (_, child_attempt) = claim(&child_db, &child_workflow).await;
+        if parent_first {
+            let tx = parent_db.transaction().await?;
+            let output: Option<serde_json::Value> = tx
+                .query_one(
+                    "select resume.wait_for($1, $2, $3)",
+                    &[&parent, &parent_attempt, &child],
+                )
+                .await?
+                .get(0);
+            assert!(output.is_none());
+            let release = async {
+                wait_until_blocked(&observer, child_pid).await?;
+                tx.commit().await?;
+                Ok::<_, resume::Error>(())
+            };
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::try_join!(
+                    async {
+                        child_db
+                            .execute(
+                                "select resume.finish($1, $2, null, 0, null, 'null')",
+                                &[&child, &child_attempt],
+                            )
+                            .await?;
+                        Ok::<_, resume::Error>(())
+                    },
+                    release
+                )
+            })
+            .await??;
+            assert_eq!(status(&observer, parent).await, "ready");
+            parent_attempt = claim(&parent_db, &workflow).await.1;
+        } else {
+            let tx = child_db.transaction().await?;
+            tx.execute(
+                "select resume.finish($1, $2, null, 0, null, 'null')",
+                &[&child, &child_attempt],
+            )
+            .await?;
+            let wait = async {
+                Ok::<_, resume::Error>(
+                    parent_db
+                        .query_one(
+                            "select resume.wait_for($1, $2, $3)",
+                            &[&parent, &parent_attempt, &child],
+                        )
+                        .await?
+                        .get::<_, Option<serde_json::Value>>(0),
+                )
+            };
+            let release = async {
+                wait_until_blocked(&observer, parent_pid).await?;
+                tx.commit().await?;
+                Ok::<_, resume::Error>(())
+            };
+            let (output, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::try_join!(wait, release)
+            })
+            .await??;
+            assert_eq!(output, Some(json!(null)));
+            assert_eq!(status(&observer, parent).await, "running");
+        }
+        let output: Option<serde_json::Value> = parent_db
+            .query_one(
+                "select resume.wait_for($1, $2, $3)",
+                &[&parent, &parent_attempt, &child],
+            )
+            .await?
+            .get(0);
+        assert_eq!(output, Some(json!(null)));
+        parent_db
+            .execute(
+                "select resume.finish($1, $2, null)",
+                &[&parent, &parent_attempt],
+            )
+            .await?;
+        assert_eq!(status(&observer, parent).await, "completed");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable database with schema.sql installed"]
+async fn worker_returns_unhandled_errors_but_continues_after_recorded_failures() -> Result<()> {
+    let mut client = connect().await;
+    // Session-local read-only mode rejects writes without closing the connection
+    // or taking DDL locks that interfere with other contract tests.
+    for settle in [false, true] {
+        let workflow = format!("worker-visibility-{settle}");
+        let id = submit(&client, &workflow, "key", &json!(null)).await?;
+        if !settle {
+            client
+                .batch_execute("set default_transaction_read_only = on")
+                .await?;
+        }
+        let called = std::cell::Cell::new(false);
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            resume::work(
+                &mut client,
+                &workflow,
+                async |_, steps| {
+                    steps
+                        .step("make-read-only", async |tx| {
+                            tx.batch_execute("set default_transaction_read_only = on")
+                                .await?;
+                            Ok(json!(null))
+                        })
+                        .await?;
+                    Err("cannot record this failure".into())
+                },
+                |_, _| {
+                    called.set(true);
+                    Retry::Stop
+                },
+            ),
+        )
+        .await?
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<tokio_postgres::Error>()
+                .unwrap()
+                .code(),
+            Some(&tokio_postgres::error::SqlState::READ_ONLY_SQL_TRANSACTION)
+        );
+        assert!(!client.is_closed());
+        assert_eq!(called.get(), settle);
+        client
+            .batch_execute("set default_transaction_read_only = off")
+            .await?;
+        let row = client
+            .query_one(
+                "select failures, last_error from resume.jobs where id = $1",
+                &[&id],
+            )
+            .await?;
+        assert_eq!(row.get::<_, i64>(0), 0);
+        assert!(row.get::<_, Option<String>>(1).is_none());
+    }
+    let workflow = "worker-visibility-continue";
+    let id = submit(&client, workflow, "key", &json!(null)).await?;
+    let calls = std::cell::Cell::new(0);
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        resume::work(
+            &mut client,
+            workflow,
+            async |job, steps| {
+                if job.failures == 0 {
+                    return Err("ordinary failure".into());
+                }
+                steps
+                    .step("make-read-only", async |tx| {
+                        tx.batch_execute("set default_transaction_read_only = on")
+                            .await?;
+                        Ok(json!(null))
+                    })
+                    .await?;
+                // Completion now fails, and persisting the callback's decision fails too.
+                Ok(json!(42))
+            },
+            |_, _| {
+                calls.set(calls.get() + 1);
+                Retry::After(Duration::ZERO)
+            },
+        ),
+    )
+    .await?
+    .unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<tokio_postgres::Error>()
+            .unwrap()
+            .code(),
+        Some(&tokio_postgres::error::SqlState::READ_ONLY_SQL_TRANSACTION)
+    );
+    assert_eq!(calls.get(), 2);
+    client
+        .batch_execute("set default_transaction_read_only = off")
+        .await?;
+    let row = client
+        .query_one(
+            "select attempt, failures, last_error from resume.jobs where id = $1",
+            &[&id],
+        )
+        .await?;
+    assert_eq!(row.get::<_, i64>(0), 2);
+    assert_eq!(row.get::<_, i64>(1), 1);
+    assert_eq!(row.get::<_, &str>(2), "ordinary failure");
+    Ok(())
+}

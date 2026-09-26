@@ -58,8 +58,9 @@ pub async fn submit_at(
         .try_get(0)?)
 }
 
-/// Run jobs one at a time until the connection closes. Idle polls wait 250 milliseconds.
-/// Attempt errors are recorded on the job and passed to `retry`; log them there.
+/// Run jobs one at a time. Idle polls wait 250 milliseconds.
+/// Recorded attempt errors go to `retry`; log them there. Infrastructure errors, including
+/// failures to claim or record an outcome, return to the caller. Reconnect or restart there.
 /// Run several workers, each with its own client, for concurrency.
 pub async fn work(
     client: &mut Client,
@@ -68,11 +69,9 @@ pub async fn work(
     retry: impl Fn(&Job, &Error) -> Retry,
 ) -> Result<()> {
     loop {
-        match run_one(client, workflow, &handler, &retry).await {
-            Ok(true) => continue,
-            Ok(false) => {}
-            Err(error) if client.is_closed() => return Err(error),
-            Err(_) => {}
+        match run_attempt(client, workflow, &handler, &retry).await? {
+            Attempt::Processed => continue,
+            Attempt::Idle | Attempt::Failed(_) => {}
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -96,6 +95,26 @@ pub async fn run_one(
     handler: impl AsyncFnOnce(&Job, &mut Steps<'_>) -> Result<Value>,
     retry: impl FnOnce(&Job, &Error) -> Retry,
 ) -> Result<bool> {
+    match run_attempt(client, workflow, handler, retry).await? {
+        Attempt::Idle => Ok(false),
+        Attempt::Processed => Ok(true),
+        Attempt::Failed(error) => Err(error),
+    }
+}
+
+// Failed means the retry decision was successfully persisted; Err means it wasn't handled.
+enum Attempt {
+    Idle,
+    Processed,
+    Failed(Error),
+}
+
+async fn run_attempt(
+    client: &mut Client,
+    workflow: &str,
+    handler: impl AsyncFnOnce(&Job, &mut Steps<'_>) -> Result<Value>,
+    retry: impl FnOnce(&Job, &Error) -> Retry,
+) -> Result<Attempt> {
     client
         .batch_execute(
             "set statement_timeout = '60s'; set idle_in_transaction_session_timeout = '60s'",
@@ -105,7 +124,7 @@ pub async fn run_one(
         .query_opt("select * from resume.claim($1)", &[&workflow])
         .await?
     else {
-        return Ok(false);
+        return Ok(Attempt::Idle);
     };
     let job = Job {
         id: row.try_get("id")?,
@@ -155,9 +174,9 @@ pub async fn run_one(
                 &[&job.id, &attempt, &message, &delay],
             )
             .await?;
-        return Err(error);
+        return Ok(Attempt::Failed(error));
     }
-    Ok(true)
+    Ok(Attempt::Processed)
 }
 
 /// Sequential execution state, borrowed exclusively for one attempt.
