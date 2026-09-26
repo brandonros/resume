@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use resume::{Result, run_one, submit};
+use resume::{Result, Retry, run_one, submit};
 use serde_json::json;
 use tokio_postgres::NoTls;
 
@@ -18,27 +18,30 @@ async fn main() -> Result<()> {
             "create table if not exists greetings (job_id bigint primary key, name text)",
         )
         .await?;
-    submit(
-        &client,
-        "greet",
-        "ada",
-        &json!({"name": "Ada"}),
-        3,
-        Duration::from_secs(1),
-    )
-    .await?;
+    submit(&client, "greet", "ada", &json!({"name": "Ada"})).await?;
     loop {
-        let result = run_one(&mut client, "greet", async |job, steps| {
-            steps
-                .step("greet", async |tx| {
-                    let name = job.input["name"].as_str().ok_or("missing name")?;
-                    tx.execute("insert into greetings values ($1, $2)", &[&job.id, &name])
-                        .await?;
-                    Ok(json!({"greeted": name}))
-                })
-                .await?;
-            Ok(())
-        })
+        let result = run_one(
+            &mut client,
+            "greet",
+            async |job, steps| {
+                steps
+                    .step("greet", async |tx| {
+                        let name = job.input["name"].as_str().ok_or("missing name")?;
+                        tx.execute("insert into greetings values ($1, $2)", &[&job.id, &name])
+                            .await?;
+                        Ok(json!({"greeted": name}))
+                    })
+                    .await?;
+                Ok(())
+            },
+            |job, _| {
+                if job.attempt < 4 {
+                    Retry::After(Duration::from_secs(1))
+                } else {
+                    Retry::Stop
+                }
+            },
+        )
         .await;
         match result {
             Ok(true) => continue,

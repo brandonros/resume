@@ -10,41 +10,39 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Data for the current job. Effects and nondeterministic decisions belong in steps.
 pub struct Job {
     pub id: i64,
+    /// Claim number, including attempts abandoned by crashed workers.
+    pub attempt: i64,
     pub key: String,
     pub input: Value,
 }
 
+/// Application decision after a reported attempt failure.
+pub enum Retry {
+    Stop,
+    After(Duration),
+}
+
 /// Submit with a client or transaction. Submission commits with the caller's transaction.
-/// `retries` is the number of additional attempts: zero means one attempt total.
-/// `retry_delay` is the wait after a reported failure; zero permits immediate retry.
-/// Crashes consume attempts too and recover at lease expiry. Duplicate submissions keep
-/// the original retry count and delay.
 pub async fn submit(
     db: &impl GenericClient,
     workflow: &str,
     key: &str,
     input: &Value,
-    retries: u32,
-    retry_delay: Duration,
 ) -> Result<i64> {
     Ok(db
         .query_one(
-            "select resume.submit($1, $2, $3, $4, $5)",
-            &[
-                &workflow,
-                &key,
-                input,
-                &i64::from(retries),
-                &retry_delay.as_secs_f64(),
-            ],
+            "select resume.submit($1, $2, $3)",
+            &[&workflow, &key, input],
         )
         .await?
         .try_get(0)?)
 }
 
 /// Process at most one job; return false when none is ready, true on completion.
-/// Handler errors release the job and are returned; retries stop when its budget is spent.
-/// Database failures propagate; abandoned jobs can retry after lease expiry if budget remains.
+/// Handler or completion errors go to `retry`; the decision is saved before returning the error.
+/// Stop pauses the job; After schedules another attempt. The callback does not run on success
+/// or idle polls. Database failures propagate; abandoned claims recover at lease expiry without
+/// consulting this callback, so an application attempt limit is not a strict crash limit.
 ///
 /// Use a dedicated client: this sets its statement and idle-transaction timeouts to
 /// 60 seconds. Step actions have a 30-second timeout and must yield to the runtime.
@@ -53,6 +51,7 @@ pub async fn run_one(
     client: &mut Client,
     workflow: &str,
     handler: impl AsyncFnOnce(&Job, &mut Steps<'_>) -> Result<()>,
+    retry: impl FnOnce(&Job, &Error) -> Retry,
 ) -> Result<bool> {
     client
         .batch_execute(
@@ -67,28 +66,48 @@ pub async fn run_one(
     };
     let job = Job {
         id: row.try_get("id")?,
+        attempt: row.try_get("attempt")?,
         key: row.try_get("key")?,
         input: row.try_get("input")?,
     };
-    let attempt = row.try_get("attempt")?;
-    let result = handler(
-        &job,
-        &mut Steps {
-            client,
-            id: job.id,
-            attempt,
-            keys: HashSet::new(),
-        },
-    )
+    let attempt = job.attempt;
+    let mut steps = Steps {
+        client,
+        id: job.id,
+        attempt,
+        position: 0,
+        keys: HashSet::new(),
+    };
+    let result: Result<()> = async {
+        handler(&job, &mut steps).await?;
+        steps
+            .client
+            .execute(
+                "select resume.finish($1, $2, null, $3)",
+                &[&job.id, &attempt, &steps.position],
+            )
+            .await?;
+        Ok(())
+    }
     .await;
-    let error = result.as_ref().err().map(ToString::to_string);
-    client
-        .execute(
-            "select resume.finish($1, $2, $3)",
-            &[&job.id, &attempt, &error],
-        )
-        .await?;
-    result?;
+    if let Err(error) = result {
+        let delay = match retry(&job, &error) {
+            Retry::Stop => None,
+            Retry::After(delay) => Some(delay.as_secs_f64()),
+        };
+        let message = error
+            .downcast_ref::<tokio_postgres::Error>()
+            .and_then(|error| error.as_db_error())
+            .map_or_else(|| error.to_string(), |db| db.message().to_owned());
+        steps
+            .client
+            .execute(
+                "select resume.finish($1, $2, $3, 0, $4)",
+                &[&job.id, &attempt, &message, &delay],
+            )
+            .await?;
+        return Err(error);
+    }
     Ok(true)
 }
 
@@ -97,45 +116,83 @@ pub struct Steps<'a> {
     client: &'a mut Client,
     id: i64,
     attempt: i64,
+    position: i32,
     keys: HashSet<String>,
 }
 
 impl Steps<'_> {
     /// Replay a saved result or atomically commit the action's database effects and output.
-    /// Use unique, stable keys and the supplied transaction for all database effects.
+    /// Use unique, stable keys in the same order, and the supplied transaction for database effects.
     /// External effects may repeat and must be idempotent. Propagate errors with `?`.
     pub async fn step(
         &mut self,
         key: &str,
         action: impl AsyncFnOnce(&Transaction<'_>) -> Result<Value>,
     ) -> Result<Value> {
-        if key.is_empty() || !self.keys.insert(key.to_owned()) {
-            return Err("step keys must be nonempty and unique within an attempt".into());
-        }
-        let tx = self.client.transaction().await?;
-        tx.execute(
-            "select resume.begin_step($1, $2)",
-            &[&self.id, &self.attempt],
-        )
-        .await?;
-        if let Some(row) = tx
-            .query_opt(
-                "select output from resume.steps where job_id = $1 and key = $2",
-                &[&self.id, &key],
-            )
-            .await?
-        {
-            let output = row.try_get(0)?;
+        let id = self.id;
+        let attempt = self.attempt;
+        let (tx, saved) = self.start(key, false).await?;
+        if let Some(output) = saved {
             tx.commit().await?;
             return Ok(output);
         }
         let output = tokio::time::timeout(Duration::from_secs(30), action(&tx)).await??;
-        tx.execute(
-            "insert into resume.steps (job_id, key, output) values ($1, $2, $3)",
-            &[&self.id, &key, &output],
-        )
-        .await?;
+        let output = save(&tx, id, attempt, key, &output).await?;
         tx.commit().await?;
         Ok(output)
     }
+
+    /// Invoke an external action at most once per job, replaying its output on retry.
+    /// The start is committed before calling; no transaction is held during the action.
+    /// Errors, timeouts, or crashes can leave an unknown outcome. Such a marker blocks
+    /// this action, all later steps, and completion, even if the handler swallows errors.
+    /// After verifying the external outcome, `resume.resolve_step(id, key, output)` records
+    /// it and pauses the job. `resume.requeue(id, delay_seconds)` explicitly allows it to continue.
+    /// Neither operation may take over an actively leased job.
+    pub async fn step_once(
+        &mut self,
+        key: &str,
+        action: impl AsyncFnOnce() -> Result<Value>,
+    ) -> Result<Value> {
+        let (tx, saved) = self.start(key, true).await?;
+        tx.commit().await?;
+        if let Some(output) = saved {
+            return Ok(output);
+        }
+        let output = tokio::time::timeout(Duration::from_secs(30), action()).await??;
+        save(&*self.client, self.id, self.attempt, key, &output).await
+    }
+
+    async fn start(&mut self, key: &str, once: bool) -> Result<(Transaction<'_>, Option<Value>)> {
+        if key.is_empty() || !self.keys.insert(key.to_owned()) {
+            return Err("step keys must be nonempty and unique within an attempt".into());
+        }
+        let next = self.position.checked_add(1).ok_or("too many steps")?;
+        let tx = self.client.transaction().await?;
+        let saved = tx
+            .query_one(
+                "select resume.start_step($1, $2, $3, $4, $5)",
+                &[&self.id, &self.attempt, &key, &self.position, &once],
+            )
+            .await?
+            .try_get(0)?;
+        self.position = next;
+        Ok((tx, saved))
+    }
+}
+
+async fn save(
+    db: &impl GenericClient,
+    id: i64,
+    attempt: i64,
+    key: &str,
+    output: &Value,
+) -> Result<Value> {
+    Ok(db
+        .query_one(
+            "select resume.save_step($1, $2, $3, $4)",
+            &[&id, &attempt, &key, output],
+        )
+        .await?
+        .try_get(0)?)
 }
