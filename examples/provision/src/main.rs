@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 use harness::{Pool, check_invariants};
 use mock_cloud::Cloud;
 use resume::{
-    Job, Permanent, Producer, Result, RetryPolicy, Worker, lock_resource, shutdown_signal,
+    Execution, Job, Permanent, Producer, Result, RetryPolicy, Worker, lock_resource,
+    shutdown_signal,
 };
 use serde_json::json;
 use tokio_postgres::Client;
@@ -18,13 +19,18 @@ const LEASE: Duration = Duration::from_secs(5);
 const STEP_TIMEOUT: Duration = Duration::from_secs(3);
 const INVARIANTS: &str = include_str!("../invariants.sql");
 
-async fn provision(run: &Job, cloud: &mut Cloud, locked: bool) -> Result<()> {
+async fn provision(
+    run: &Job,
+    execution: &mut Execution<'_>,
+    cloud: &mut Cloud,
+    locked: bool,
+) -> Result<()> {
     let team = run.input["team"].as_str().ok_or("team must be a string")?;
     let request_id = &run.idempotency_key;
 
     // Hold the team lock across the cloud's separate count and create calls, so concurrent
     // requests cannot both see room and exceed the quota.
-    let vm = run
+    let vm = execution
         .step("ensure_vm", async |tx| {
             if locked {
                 lock_resource(tx, &format!("team:{team}")).await?;
@@ -42,15 +48,16 @@ async fn provision(run: &Job, cloud: &mut Cloud, locked: bool) -> Result<()> {
         })
         .await?;
 
-    run.step("record_sandbox", async |tx| {
-        tx.execute(
-            "insert into provision.sandboxes (request_id, team, vm_id) values ($1, $2, $3)",
-            &[request_id, &team, &vm.as_i64()],
-        )
+    execution
+        .step("record_sandbox", async |tx| {
+            tx.execute(
+                "insert into provision.sandboxes (request_id, team, vm_id) values ($1, $2, $3)",
+                &[request_id, &team, &vm.as_i64()],
+            )
+            .await?;
+            Ok(json!(null))
+        })
         .await?;
-        Ok(json!(null))
-    })
-    .await?;
 
     tracing::info!("sandbox ready on VM {vm}");
     Ok(())
@@ -160,8 +167,8 @@ async fn main() -> Result<()> {
             Worker::new(client, "provision", VERSION)
                 .lease(LEASE)
                 .step_timeout(STEP_TIMEOUT)
-                .run(shutdown_signal(), async |run| {
-                    provision(run, &mut cloud, locked).await
+                .run(shutdown_signal(), async |run, execution| {
+                    provision(run, execution, &mut cloud, locked).await
                 })
                 .await
         }

@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use harness::{Pool, Rng, check_invariants};
 use mock_warehouse::Warehouse;
-use resume::{Job, Producer, Result, Worker, shutdown_signal};
+use resume::{Execution, Job, Producer, Result, Worker, shutdown_signal};
 use serde_json::{Value, json};
 use tokio_postgres::{Client, Transaction};
 
@@ -15,25 +15,31 @@ const INVARIANTS: &str = include_str!("../invariants.sql");
 
 /// Checks payment and ships under one lock. `SEPARATE=1` splits them into two steps,
 /// allowing a cancellation between the check and shipment.
-async fn ship_order(run: &Job, warehouse: &mut Warehouse, separate: bool) -> Result<()> {
+async fn ship_order(
+    run: &Job,
+    execution: &mut Execution<'_>,
+    warehouse: &mut Warehouse,
+    separate: bool,
+) -> Result<()> {
     let order_id = run.input["order_id"]
         .as_i64()
         .ok_or("order_id must be an integer")?;
 
     if separate {
-        let paid = run
+        let paid = execution
             .step("check_paid", async |tx| {
                 Ok(json!(status(tx, order_id, false).await? == "paid"))
             })
             .await?;
         if paid == true {
-            run.step("ship", async |tx| ship(warehouse, tx, order_id).await)
+            execution
+                .step("ship", async |tx| ship(warehouse, tx, order_id).await)
                 .await?;
         }
         return Ok(());
     }
 
-    let shipped = run
+    let shipped = execution
         .step("ship", async |tx| {
             // Lock the order, so a cancellation waits until this step commits.
             match status(tx, order_id, true).await?.as_str() {
@@ -163,8 +169,8 @@ async fn main() -> Result<()> {
             Worker::new(client, "shipping", VERSION)
                 .lease(LEASE)
                 .step_timeout(STEP_TIMEOUT)
-                .run(shutdown_signal(), async |run| {
-                    ship_order(run, &mut warehouse, separate).await
+                .run(shutdown_signal(), async |run, execution| {
+                    ship_order(run, execution, &mut warehouse, separate).await
                 })
                 .await
         }

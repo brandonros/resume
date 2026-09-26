@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use mock_vendors::{Faults, Vendors};
 
-use resume::{Job, Permanent, Producer, Result, Worker, lock_resource, shutdown_signal};
+use resume::{Execution, Job, Permanent, Producer, Result, Worker, lock_resource, shutdown_signal};
 use serde_json::json;
 
 pub const VERSION: &str = "1";
@@ -16,26 +16,27 @@ const SETUP_FEE_CENTS: i64 = 5000;
 pub const LEASE: Duration = Duration::from_secs(5);
 const STEP_TIMEOUT: Duration = Duration::from_secs(3);
 
-async fn onboard(run: &Job, v: &mut Vendors) -> Result<()> {
+async fn onboard(run: &Job, execution: &mut Execution<'_>, v: &mut Vendors) -> Result<()> {
     let email = run.input["email"]
         .as_str()
         .ok_or("email must be a string")?;
     let plan = run.input["plan"].as_str().ok_or("plan must be a string")?;
 
     // Invalid input cannot be fixed by retrying.
-    run.step("validate", async |_| {
-        if !email.contains('@') {
-            return Err(Permanent(format!("invalid email {email:?}")).into());
-        }
-        if !matches!(plan, "free" | "pro") {
-            return Err(Permanent(format!("unknown plan {plan:?}")).into());
-        }
-        Ok(json!(null))
-    })
-    .await?;
+    execution
+        .step("validate", async |_| {
+            if !email.contains('@') {
+                return Err(Permanent(format!("invalid email {email:?}")).into());
+            }
+            if !matches!(plan, "free" | "pro") {
+                return Err(Permanent(format!("unknown plan {plan:?}")).into());
+            }
+            Ok(json!(null))
+        })
+        .await?;
 
     // The insert and step result commit together.
-    let customer_id = run
+    let customer_id = execution
         .step("create_customer", async |tx| {
             let row = tx
                 .query_one(
@@ -51,7 +52,7 @@ async fn onboard(run: &Job, v: &mut Vendors) -> Result<()> {
 
     // Lookup recovers a contact created before a crash. Lock across lookup and creation
     // to prevent concurrent runs from creating duplicates.
-    let crm_contact_id = run
+    let crm_contact_id = execution
         .step("ensure_crm_contact", async |tx| {
             lock_resource(tx, &format!("crm_contact:{customer_id}")).await?;
             if let Some(id) = v.find_crm_contact(customer_id).await? {
@@ -62,7 +63,7 @@ async fn onboard(run: &Job, v: &mut Vendors) -> Result<()> {
         .await?;
 
     // The vendor returns the same customer for every retry of this key.
-    let billing_customer_id = run
+    let billing_customer_id = execution
         .step("ensure_billing_customer", async |_| {
             Ok(json!(
                 v.create_billing_customer(&format!("billing_customer:{customer_id}"), email)
@@ -72,7 +73,7 @@ async fn onboard(run: &Job, v: &mut Vendors) -> Result<()> {
         .await?;
 
     // Save branch decisions so retries follow the same steps even if customer state changes.
-    let need = run
+    let need = execution
         .step("decide", async |tx| {
             let row = tx
                 .query_one(
@@ -90,19 +91,20 @@ async fn onboard(run: &Job, v: &mut Vendors) -> Result<()> {
     // Lookup recovers a charge made before a crash.
     let setup_fee_key = format!("setup_fee:{customer_id}");
     let setup_fee_charge_id = if need["setup_fee"] == true {
-        run.step("ensure_setup_fee", async |_| {
-            if let Some(id) = v.find_charge(&setup_fee_key).await? {
-                return Ok(json!(id));
-            }
-            let billing_customer_id = billing_customer_id
-                .as_i64()
-                .ok_or("billing customer ID must be an integer")?;
-            Ok(json!(
-                v.charge(&setup_fee_key, billing_customer_id, SETUP_FEE_CENTS)
-                    .await?
-            ))
-        })
-        .await?
+        execution
+            .step("ensure_setup_fee", async |_| {
+                if let Some(id) = v.find_charge(&setup_fee_key).await? {
+                    return Ok(json!(id));
+                }
+                let billing_customer_id = billing_customer_id
+                    .as_i64()
+                    .ok_or("billing customer ID must be an integer")?;
+                Ok(json!(
+                    v.charge(&setup_fee_key, billing_customer_id, SETUP_FEE_CENTS)
+                        .await?
+                ))
+            })
+            .await?
     } else {
         json!(null)
     };
@@ -111,38 +113,41 @@ async fn onboard(run: &Job, v: &mut Vendors) -> Result<()> {
     // an operator to check the outbox.
     let welcomed = need["welcome"] == true;
     if welcomed {
-        run.step_once("send_welcome_email", async || {
-            Ok(json!(v.send_email(email, "welcome").await?))
-        })
-        .await?;
+        execution
+            .step_once("send_welcome_email", async || {
+                Ok(json!(v.send_email(email, "welcome").await?))
+            })
+            .await?;
     }
 
-    run.step("link_customer", async |tx| {
-        tx.execute(
-            "update onboard.customers
+    execution
+        .step("link_customer", async |tx| {
+            tx.execute(
+                "update onboard.customers
              set crm_contact_id = $2, billing_customer_id = $3, setup_fee_charge_id = $4,
                  welcomed_at = case when $5 then coalesce(welcomed_at, now()) else welcomed_at end
              where id = $1",
-            &[
-                &customer_id,
-                &crm_contact_id.as_i64(),
-                &billing_customer_id.as_i64(),
-                &setup_fee_charge_id.as_i64(),
-                &welcomed,
-            ],
-        )
+                &[
+                    &customer_id,
+                    &crm_contact_id.as_i64(),
+                    &billing_customer_id.as_i64(),
+                    &setup_fee_charge_id.as_i64(),
+                    &welcomed,
+                ],
+            )
+            .await?;
+            Ok(json!(null))
+        })
         .await?;
-        Ok(json!(null))
-    })
-    .await?;
 
     // Duplicate notifications are harmless, so this step may repeat.
-    run.step("notify_slack", async |_| {
-        v.post_slack(&format!("onboarded {email} on {plan}"))
-            .await?;
-        Ok(json!(null))
-    })
-    .await?;
+    execution
+        .step("notify_slack", async |_| {
+            v.post_slack(&format!("onboarded {email} on {plan}"))
+                .await?;
+            Ok(json!(null))
+        })
+        .await?;
 
     tracing::info!("onboarded customer {customer_id}");
     Ok(())
@@ -178,8 +183,8 @@ async fn main() -> Result<()> {
             Worker::new(client, "onboard", VERSION)
                 .lease(LEASE)
                 .step_timeout(STEP_TIMEOUT)
-                .run(shutdown_signal(), async |run| {
-                    onboard(run, &mut vendors).await
+                .run(shutdown_signal(), async |run, execution| {
+                    onboard(run, execution, &mut vendors).await
                 })
                 .await
         }

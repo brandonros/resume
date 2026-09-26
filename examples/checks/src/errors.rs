@@ -56,25 +56,27 @@ pub(super) async fn wrapped_errors_preserve_failure_and_snooze_policy() {
             async {
                 let _ = shutdown.await;
             },
-            async |run| {
+            async |run, execution| {
                 if run.id == once {
-                    run.step_once("send", async || {
-                        Err(context(Snooze(Duration::from_secs(300)).into()))
-                    })
-                    .await
-                    .map_err(context)?;
+                    execution
+                        .step_once("send", async || {
+                            Err(context(Snooze(Duration::from_secs(300)).into()))
+                        })
+                        .await
+                        .map_err(context)?;
                 } else {
-                    run.step("work", async |_| {
-                        if run.id == permanent {
-                            return Err(Permanent("invalid input".into()).into());
-                        }
-                        if !ready.load(Ordering::Relaxed) {
-                            return Err(Snooze(Duration::from_secs(300)).into());
-                        }
-                        Ok(json!("ready"))
-                    })
-                    .await
-                    .map_err(context)?;
+                    execution
+                        .step("work", async |_| {
+                            if run.id == permanent {
+                                return Err(Permanent("invalid input".into()).into());
+                            }
+                            if !ready.load(Ordering::Relaxed) {
+                                return Err(Snooze(Duration::from_secs(300)).into());
+                            }
+                            Ok(json!("ready"))
+                        })
+                        .await
+                        .map_err(context)?;
                 }
                 Ok(())
             },
@@ -128,7 +130,7 @@ pub(super) async fn nonretryable_claim_error_stops_the_worker() {
         Duration::from_secs(2),
         Worker::new(client, workflow("read-only-worker"), "1")
             .poll_interval(Duration::from_millis(10))
-            .run(pending(), async |_| {
+            .run(pending(), async |_, _| {
                 panic!("claimed on a read-only connection")
             }),
     )
@@ -172,7 +174,7 @@ pub(super) async fn transient_claim_error_retries_then_processes_work() {
             async {
                 let _ = shutdown.await;
             },
-            async |_| Ok(()),
+            async |_, _| Ok(()),
         );
     let observer = async {
         // Observe the failed claim returning to idle before releasing the lock. This

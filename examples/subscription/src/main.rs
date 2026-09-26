@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 
 use harness::{Pool, Rng, check_invariants};
 use mock_billing::Billing;
-use resume::{Job, Producer, Result, RetryPolicy, Worker, lock_resource, shutdown_signal};
+use resume::{
+    Execution, Job, Producer, Result, RetryPolicy, Worker, lock_resource, shutdown_signal,
+};
 use serde_json::{Value, json};
 use tokio_postgres::{Client, Transaction};
 
@@ -17,13 +19,18 @@ const INVARIANTS: &str = include_str!("../invariants.sql");
 
 /// Applies the latest requested plan. `PLAIN=1` omits `is_latest`, allowing stale requests
 /// to overwrite newer plans.
-async fn change_plan(run: &Job, billing: &mut Billing, plain: bool) -> Result<()> {
+async fn change_plan(
+    run: &Job,
+    execution: &mut Execution<'_>,
+    billing: &mut Billing,
+    plain: bool,
+) -> Result<()> {
     let customer_id = run.input["customer_id"]
         .as_i64()
         .ok_or("customer_id must be an integer")?;
     let plan = run.input["plan"].as_str().ok_or("plan must be a string")?;
 
-    let applied = run
+    let applied = execution
         .step("set_plan", async |tx| {
             if !plain && !run.is_latest(tx).await? {
                 return Ok(json!({"skipped": "superseded by a newer request"}));
@@ -152,8 +159,8 @@ async fn main() -> Result<()> {
             Worker::new(client, "subscription", VERSION)
                 .lease(LEASE)
                 .step_timeout(STEP_TIMEOUT)
-                .run(shutdown_signal(), async |run| {
-                    change_plan(run, &mut billing, plain).await
+                .run(shutdown_signal(), async |run, execution| {
+                    change_plan(run, execution, &mut billing, plain).await
                 })
                 .await
         }

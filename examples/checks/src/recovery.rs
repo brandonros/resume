@@ -242,14 +242,15 @@ pub(super) async fn worker_exhaustion_queues_handler_without_step_output() {
             async {
                 let _ = shutdown.await;
             },
-            async |run| {
-                run.step("charge", async |_| {
-                    vendor
-                        .execute("insert into checks.vendor_effects values ($1)", &[&run.id])
-                        .await?;
-                    Err("vendor committed, but its response was lost".into())
-                })
-                .await?;
+            async |run, execution| {
+                execution
+                    .step("charge", async |_| {
+                        vendor
+                            .execute("insert into checks.vendor_effects values ($1)", &[&run.id])
+                            .await?;
+                        Err("vendor committed, but its response was lost".into())
+                    })
+                    .await?;
                 Ok(())
             },
         );
@@ -399,8 +400,8 @@ pub(super) async fn completion_rejects_unresolved_and_unvisited_steps() {
             async {
                 let _ = shutdown.await;
             },
-            async |run| {
-                let _ = run
+            async |_, execution| {
+                let _ = execution
                     .step_once("send", async || Err("vendor timed out".into()))
                     .await;
                 Ok(())
@@ -450,8 +451,9 @@ pub(super) async fn step_once_error_fails_the_run_without_retrying() {
             async {
                 let _ = shutdown.await;
             },
-            async |run| {
-                run.step_once("send", async || Err("vendor timed out".into()))
+            async |_, execution| {
+                execution
+                    .step_once("send", async || Err("vendor timed out".into()))
                     .await?;
                 Ok(())
             },
@@ -496,17 +498,18 @@ pub(super) async fn cancelling_during_a_step_once_action_keeps_its_result() {
             async {
                 let _ = shutdown.await;
             },
-            async |run| {
-                run.step_once("send", async || {
-                    // Only the first call waits; a replay never calls this again.
-                    let gate = gate.lock().unwrap().take();
-                    if let Some(gate) = gate {
-                        let _ = gate.await;
-                    }
-                    Ok(json!(42))
-                })
-                .await?;
-                run.step("after", async |_| Ok(json!(true))).await?;
+            async |_, execution| {
+                execution
+                    .step_once("send", async || {
+                        // Only the first call waits; a replay never calls this again.
+                        let gate = gate.lock().unwrap().take();
+                        if let Some(gate) = gate {
+                            let _ = gate.await;
+                        }
+                        Ok(json!(42))
+                    })
+                    .await?;
+                execution.step("after", async |_| Ok(json!(true))).await?;
                 Ok(())
             },
         );

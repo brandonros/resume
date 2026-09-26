@@ -48,11 +48,11 @@ pub(super) async fn snooze_releases_worker_and_locks_preserves_progress_and_cost
             async {
                 let _ = shutdown.await;
             },
-            async |run| {
+            async |run, execution| {
                 if run.id != paused {
                     return Ok(());
                 }
-                let export = run
+                let export = execution
                     .step("start_export", async |tx| {
                         starts.fetch_add(1, Ordering::Relaxed);
                         tx.execute(
@@ -64,7 +64,7 @@ pub(super) async fn snooze_releases_worker_and_locks_preserves_progress_and_cost
                     })
                     .await?;
                 assert_eq!(export, json!({"id": "export-123"}));
-                run.step("check_export", async |tx| {
+                execution.step("check_export", async |tx| {
                     checks.fetch_add(1, Ordering::Relaxed);
                     tx.execute(
                         "update checks.snooze_effects set writes = writes + 100 where run_id = $1",
@@ -230,12 +230,13 @@ pub(super) async fn step_once_cannot_snooze_and_repeat_its_action() {
             async {
                 let _ = shutdown.await;
             },
-            async |run| {
-                run.step_once(
-                    "send",
-                    async || Err(Snooze(Duration::from_secs(300)).into()),
-                )
-                .await?;
+            async |_, execution| {
+                execution
+                    .step_once(
+                        "send",
+                        async || Err(Snooze(Duration::from_secs(300)).into()),
+                    )
+                    .await?;
                 Ok(())
             },
         );

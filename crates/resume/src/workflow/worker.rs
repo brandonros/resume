@@ -1,21 +1,18 @@
 //! Workers claim and execute workflow runs until shutdown.
 
 use std::pin::pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use tokio::sync::Mutex;
 use tokio_postgres::Client;
 use tracing::Instrument;
 
 use crate::Result;
 use crate::error::{ErrorKind, classify};
-use crate::executor::Job;
+use crate::executor::{Execution, Job};
 
 pub struct Worker {
-    /// Shared with the claimed run, which uses it for its steps.
-    client: Arc<Mutex<Client>>,
+    client: Client,
     workflow: String,
     version: String,
     lease: Duration,
@@ -30,7 +27,7 @@ impl Worker {
     /// Defaults to a 60 second lease and a 30 second step timeout.
     pub fn new(client: Client, workflow: impl Into<String>, version: impl Into<String>) -> Self {
         Self {
-            client: Arc::new(Mutex::new(client)),
+            client,
             workflow: workflow.into(),
             version: version.into(),
             lease: Duration::from_secs(60),
@@ -73,10 +70,26 @@ impl Worker {
     /// Claim queries retry serialization failures, deadlocks, lock unavailability, and query
     /// cancellation after the poll interval. Other claim errors and closed connections are
     /// returned to the caller, including schema and permission errors.
+    ///
+    /// The handler receives immutable job data and exclusive access to its step executor:
+    ///
+    /// ```no_run
+    /// # async fn example(client: tokio_postgres::Client) -> resume::Result<()> {
+    /// resume::Worker::new(client, "example", "1")
+    ///     .run(resume::shutdown_signal(), async |job, execution| {
+    ///         execution.step("save", async |tx| {
+    ///             tx.execute("insert into results (id, input) values ($1, $2)",
+    ///                 &[&job.id, &job.input]).await?;
+    ///             Ok(serde_json::json!(true))
+    ///         }).await?;
+    ///         Ok(())
+    ///     }).await
+    /// # }
+    /// ```
     pub async fn run(
-        self,
+        mut self,
         shutdown: impl Future<Output = ()>,
-        mut execute: impl AsyncFnMut(&Job) -> Result<()>,
+        mut execute: impl AsyncFnMut(&Job, &mut Execution<'_>) -> Result<()>,
     ) -> Result<()> {
         if self.step_timeout >= self.lease {
             return Err("step timeout must be shorter than the lease".into());
@@ -88,8 +101,6 @@ impl Worker {
         // The shorter step timeout leaves healthy workers time to save and commit.
         let lease_ms = self.lease.as_millis();
         self.client
-            .lock()
-            .await
             .batch_execute(&format!(
                 "set idle_in_transaction_session_timeout = {lease_ms};
                  set statement_timeout = {lease_ms};
@@ -100,7 +111,7 @@ impl Worker {
             .await?;
 
         let workflow = self.workflow.clone();
-        let stopping = Arc::new(AtomicBool::new(false));
+        let stopping = AtomicBool::new(false);
         let mut shutdown = pin!(shutdown);
         tracing::info!(
             "{workflow}: worker started (version {}, lease {:?}, step timeout {:?})",
@@ -110,9 +121,9 @@ impl Worker {
         );
         let mut waiting = false;
         while !stopping.load(Ordering::Relaxed) {
-            let claimed = match self.claim_run(&stopping).await {
+            let claimed = match self.claim_run().await {
                 Ok(claimed) => claimed,
-                Err(error) if self.client.lock().await.is_closed() => return Err(error),
+                Err(error) if self.client.is_closed() => return Err(error),
                 Err(error) if classify(error.as_ref()) == ErrorKind::TransientDatabase => {
                     tracing::warn!("{workflow}: could not claim ({error}); trying again");
                     None
@@ -145,10 +156,17 @@ impl Worker {
                 tracing::info!(parent: &span, "{claimed}");
             }
             let result = {
+                let mut execution = Execution::new(
+                    &run,
+                    &mut self.client,
+                    &stopping,
+                    self.lease,
+                    self.step_timeout,
+                );
                 let mut work = pin!(
                     async {
-                        execute(&run).await?;
-                        run.complete_run().await
+                        execute(&run, &mut execution).await?;
+                        execution.complete_run().await
                     }
                     .instrument(span.clone())
                 );
@@ -199,7 +217,7 @@ impl Worker {
             )),
             _ => None,
         };
-        let client = self.client.lock().await;
+        let client = &self.client;
         if let Some((delay, done)) = released {
             match client
                 .execute(
@@ -238,8 +256,8 @@ impl Worker {
     }
 
     /// Returns the claimed run, and whether the previous attempt's lease expired.
-    async fn claim_run(&self, stopping: &Arc<AtomicBool>) -> Result<Option<(Job, bool)>> {
-        let client = self.client.lock().await;
+    async fn claim_run(&self) -> Result<Option<(Job, bool)>> {
+        let client = &self.client;
         client
             .execute("select resume.expire_runs($1)", &[&self.workflow])
             .await?;
@@ -252,13 +270,7 @@ impl Worker {
             .await?;
 
         row.map(|row| {
-            let run = Job::from_claim(
-                &row,
-                self.client.clone(),
-                self.lease,
-                self.step_timeout,
-                stopping.clone(),
-            )?;
+            let run = Job::from_claim(&row)?;
             Ok((run, row.try_get("expired")?))
         })
         .transpose()

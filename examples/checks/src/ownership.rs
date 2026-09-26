@@ -201,9 +201,9 @@ pub(super) async fn a_step_key_used_twice_fails_the_run() {
             async {
                 let _ = shutdown.await;
             },
-            async |run| {
+            async |_, execution| {
                 for _ in 0..2 {
-                    run.step("same", async |_| Ok(json!(1))).await?;
+                    execution.step("same", async |_| Ok(json!(1))).await?;
                 }
                 Ok(())
             },
@@ -247,8 +247,8 @@ pub(super) async fn shutdown_finishes_current_step_and_releases_saved_progress()
             shutdown.await.unwrap();
             stopping.notify_one();
         },
-        async |run| {
-            let output = run
+        async |_, execution| {
+            let output = execution
                 .step("first", async |_| {
                     first_calls.fetch_add(1, Ordering::Relaxed);
                     started.notify_one();
@@ -257,12 +257,13 @@ pub(super) async fn shutdown_finishes_current_step_and_releases_saved_progress()
                 })
                 .await?;
             assert_eq!(output, json!(42));
-            run.step("second", async |_| {
-                second_calls.fetch_add(1, Ordering::Relaxed);
-                Ok(json!(true))
-            })
-            .await
-            .map_err(crate::errors::context)?;
+            execution
+                .step("second", async |_| {
+                    second_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(json!(true))
+                })
+                .await
+                .map_err(crate::errors::context)?;
             Ok(())
         },
     );
@@ -305,19 +306,20 @@ pub(super) async fn shutdown_finishes_current_step_and_releases_saved_progress()
         async {
             let _ = shutdown.await;
         },
-        async |run| {
-            let output = run
+        async |_, execution| {
+            let output = execution
                 .step("first", async |_| {
                     first_calls.fetch_add(1, Ordering::Relaxed);
                     Ok(json!(0))
                 })
                 .await?;
             assert_eq!(output, json!(42));
-            run.step("second", async |_| {
-                second_calls.fetch_add(1, Ordering::Relaxed);
-                Ok(json!(true))
-            })
-            .await?;
+            execution
+                .step("second", async |_| {
+                    second_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(json!(true))
+                })
+                .await?;
             Ok(())
         },
     );

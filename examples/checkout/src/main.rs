@@ -3,7 +3,7 @@ mod mock_vendor;
 use std::time::Duration;
 
 use mock_vendor::MockVendor;
-use resume::{Job, Permanent, Producer, Result, Worker, shutdown_signal};
+use resume::{Execution, Job, Permanent, Producer, Result, Worker, shutdown_signal};
 use serde_json::json;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -11,27 +11,35 @@ use tokio::task::JoinSet;
 const VERSION: &str = "1";
 const WORKFLOWS: [&str; 2] = ["checkout", "checkout_failure"];
 
-async fn checkout(run: &Job, vendor: &mut MockVendor) -> Result<()> {
+async fn checkout(run: &Job, execution: &mut Execution<'_>, vendor: &mut MockVendor) -> Result<()> {
     let order = run.input["order"].as_str().ok_or("missing order")?;
-    run.step("charge", async |_| {
-        vendor.apply(order, "payment", "charge").await?;
-        Ok(json!({"charged": true}))
-    })
-    .await?;
-    run.step("reserve", async |_| {
-        vendor.apply(order, "reservation", "reserve").await?;
-        Ok(json!({"reserved": true}))
-    })
-    .await?;
+    execution
+        .step("charge", async |_| {
+            vendor.apply(order, "payment", "charge").await?;
+            Ok(json!({"charged": true}))
+        })
+        .await?;
+    execution
+        .step("reserve", async |_| {
+            vendor.apply(order, "reservation", "reserve").await?;
+            Ok(json!({"reserved": true}))
+        })
+        .await?;
 
-    run.step("ship", async |_| {
-        Err(Permanent("shipping rejected the order".into()).into())
-    })
-    .await?;
+    execution
+        .step("ship", async |_| {
+            Err(Permanent("shipping rejected the order".into()).into())
+        })
+        .await?;
     Ok(())
 }
 
-async fn undo(run: &Job, vendor: &mut MockVendor, refund: bool) -> Result<()> {
+async fn undo(
+    run: &Job,
+    execution: &mut Execution<'_>,
+    vendor: &mut MockVendor,
+    refund: bool,
+) -> Result<()> {
     let args = &run.input["input"];
     let order = args["order"].as_str().ok_or("missing original order")?;
     let (kind, action) = if refund {
@@ -39,23 +47,24 @@ async fn undo(run: &Job, vendor: &mut MockVendor, refund: bool) -> Result<()> {
     } else {
         ("reservation", "release")
     };
-    run.step(action, async |_| {
-        vendor.undo(order, kind, action).await?;
-        if refund && args["crash_refund"] == true && vendor.first_refund_crash(order).await? {
-            // The vendor committed the refund, but the step has not saved its result yet.
-            tracing::warn!(
-                order,
-                "simulated crash after refund; restart checkout-process"
-            );
-            std::process::exit(99);
-        }
-        Ok(json!({"undone": true}))
-    })
-    .await?;
+    execution
+        .step(action, async |_| {
+            vendor.undo(order, kind, action).await?;
+            if refund && args["crash_refund"] == true && vendor.first_refund_crash(order).await? {
+                // The vendor committed the refund, but the step has not saved its result yet.
+                tracing::warn!(
+                    order,
+                    "simulated crash after refund; restart checkout-process"
+                );
+                std::process::exit(99);
+            }
+            Ok(json!({"undone": true}))
+        })
+        .await?;
     Ok(())
 }
 
-async fn notify_failure(run: &Job) -> Result<()> {
+async fn notify_failure(run: &Job, execution: &mut Execution<'_>) -> Result<()> {
     let failed_run = run.input["failed_run"]
         .as_i64()
         .ok_or("missing failed run")?;
@@ -65,7 +74,7 @@ async fn notify_failure(run: &Job) -> Result<()> {
     let reason = run.input["error"]
         .as_str()
         .ok_or("missing failure reason")?;
-    run.step("notify", async |tx| {
+    execution.step("notify", async |tx| {
         let unfinished: bool = tx.query_one(
             "select exists (select 1 from checkout.effects where order_key = $1 and not undone)",
             &[&order],
@@ -106,12 +115,12 @@ async fn work(url: &str) -> Result<()> {
                             }
                         }
                     },
-                    async |run| match workflow {
-                        "checkout" => checkout(run, &mut vendor).await,
+                    async |run, execution| match workflow {
+                        "checkout" => checkout(run, execution, &mut vendor).await,
                         _ => {
-                            undo(run, &mut vendor, false).await?;
-                            undo(run, &mut vendor, true).await?;
-                            notify_failure(run).await
+                            undo(run, execution, &mut vendor, false).await?;
+                            undo(run, execution, &mut vendor, true).await?;
+                            notify_failure(run, execution).await
                         }
                     },
                 )

@@ -5,7 +5,7 @@ mod workflow;
 use std::fmt;
 use std::time::Duration;
 
-pub use executor::{Job, lock_resource};
+pub use executor::{Execution, Job, lock_resource};
 pub use workflow::{JobHandle, JobOutcome, Producer, RetryPolicy, Worker, shutdown_signal};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;

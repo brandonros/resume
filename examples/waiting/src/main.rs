@@ -1,23 +1,26 @@
 use std::time::Duration;
 
-use resume::{Job, JobHandle, JobOutcome, Permanent, Producer, Result, Worker, shutdown_signal};
+use resume::{
+    Execution, Job, JobHandle, JobOutcome, Permanent, Producer, Result, Worker, shutdown_signal,
+};
 use serde_json::json;
 
 const WORKFLOW: &str = "waiting";
 const VERSION: &str = "1";
 const USAGE: &str = "expected work or submit <key> [success|fail|slow] [timeout-ms]";
 
-async fn process(job: &Job) -> Result<()> {
-    job.step("prepare", async |_| {
-        match job.input["mode"].as_str() {
-            Some("success") => {}
-            Some("slow") => tokio::time::sleep(Duration::from_secs(2)).await,
-            Some("fail") => return Err(Permanent("example rejection".into()).into()),
-            _ => return Err(Permanent("unknown mode".into()).into()),
-        }
-        Ok(json!({"prepared": true}))
-    })
-    .await?;
+async fn process(job: &Job, execution: &mut Execution<'_>) -> Result<()> {
+    execution
+        .step("prepare", async |_| {
+            match job.input["mode"].as_str() {
+                Some("success") => {}
+                Some("slow") => tokio::time::sleep(Duration::from_secs(2)).await,
+                Some("fail") => return Err(Permanent("example rejection".into()).into()),
+                _ => return Err(Permanent("unknown mode".into()).into()),
+            }
+            Ok(json!({"prepared": true}))
+        })
+        .await?;
     Ok(())
 }
 
@@ -28,7 +31,9 @@ async fn main() -> Result<()> {
         Some("work") if args.next().is_none() => {
             let (_, client) = harness::start().await?;
             Worker::new(client, WORKFLOW, VERSION)
-                .run(shutdown_signal(), async |job| process(job).await)
+                .run(shutdown_signal(), async |job, execution| {
+                    process(job, execution).await
+                })
                 .await
         }
         Some("submit") => {
