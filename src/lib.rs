@@ -4,6 +4,9 @@ use std::time::{Duration, SystemTime};
 use serde_json::Value;
 use tokio_postgres::{Client, GenericClient, Transaction};
 
+mod saga;
+pub use saga::{Compensating, Saga, SagaOutcome};
+
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -141,6 +144,7 @@ async fn run_attempt(
         position: 0,
         keys: HashSet::new(),
         suspended: false,
+        saga_started: false,
     };
     let result: Result<()> = async {
         let output = handler(&job, &mut steps).await;
@@ -187,6 +191,7 @@ pub struct Steps<'a> {
     position: i32,
     keys: HashSet<String>,
     suspended: bool,
+    saga_started: bool,
 }
 
 /// Returned by `sleep` and `wait_for` after releasing the claim. Propagate it with `?`;
@@ -211,9 +216,21 @@ impl Steps<'_> {
         key: &str,
         action: impl AsyncFnOnce(&Transaction<'_>) -> Result<Value>,
     ) -> Result<Value> {
+        self.step_registered(key, None, false, action).await
+    }
+
+    async fn step_registered(
+        &mut self,
+        key: &str,
+        compensation: Option<&str>,
+        is_compensation: bool,
+        action: impl AsyncFnOnce(&Transaction<'_>) -> Result<Value>,
+    ) -> Result<Value> {
         let id = self.id;
         let attempt = self.attempt;
-        let (tx, saved) = self.start(key, false).await?;
+        let (tx, saved) = self
+            .start(key, false, compensation, is_compensation)
+            .await?;
         if let Some(output) = saved {
             tx.commit().await?;
             return Ok(output);
@@ -236,7 +253,16 @@ impl Steps<'_> {
         key: &str,
         action: impl AsyncFnOnce() -> Result<Value>,
     ) -> Result<Value> {
-        let (tx, saved) = self.start(key, true).await?;
+        self.once_registered(key, None, action).await
+    }
+
+    async fn once_registered(
+        &mut self,
+        key: &str,
+        compensation: Option<&str>,
+        action: impl AsyncFnOnce() -> Result<Value>,
+    ) -> Result<Value> {
+        let (tx, saved) = self.start(key, true, compensation, false).await?;
         tx.commit().await?;
         if let Some(output) = saved {
             return Ok(output);
@@ -317,7 +343,13 @@ impl Steps<'_> {
         }
     }
 
-    async fn start(&mut self, key: &str, once: bool) -> Result<(Transaction<'_>, Option<Value>)> {
+    async fn start(
+        &mut self,
+        key: &str,
+        once: bool,
+        compensation: Option<&str>,
+        is_compensation: bool,
+    ) -> Result<(Transaction<'_>, Option<Value>)> {
         if self.suspended {
             return Err(Suspended.into());
         }
@@ -328,8 +360,16 @@ impl Steps<'_> {
         let tx = self.client.transaction().await?;
         let saved = tx
             .query_one(
-                "select resume.start_step($1, $2, $3, $4, $5)",
-                &[&self.id, &self.attempt, &key, &self.position, &once],
+                "select resume.start_step($1, $2, $3, $4, $5, $6, $7)",
+                &[
+                    &self.id,
+                    &self.attempt,
+                    &key,
+                    &self.position,
+                    &once,
+                    &compensation,
+                    &is_compensation,
+                ],
             )
             .await?
             .try_get(0)?;

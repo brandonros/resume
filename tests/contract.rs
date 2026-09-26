@@ -216,7 +216,7 @@ async fn a_step_lock_prevents_reclaim_after_the_visible_lease_expires() -> Resul
             .is_none()
     );
     tx.execute(
-        "insert into resume.steps values ($1, 'saved', 0, false, '42')",
+        "insert into resume.steps (job_id, key, position, once, output) values ($1, 'saved', 0, false, '42')",
         &[&id],
     )
     .await?;
@@ -1563,5 +1563,164 @@ async fn worker_returns_unhandled_errors_but_continues_after_recorded_failures()
     assert_eq!(row.get::<_, i64>(0), 2);
     assert_eq!(row.get::<_, i64>(1), 1);
     assert_eq!(row.get::<_, &str>(2), "ordinary failure");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable database with schema.sql installed"]
+async fn connection_loss_preserves_step_boundaries_and_fences_old_workers() -> Result<()> {
+    let mut observer = connect().await;
+    observer
+        .batch_execute("create table disconnected_effects (job_id bigint primary key)")
+        .await?;
+    for phase in ["uncommitted", "committed", "once"] {
+        let workflow = format!("disconnect-{phase}");
+        let url = std::env::var("DATABASE_URL")?;
+        let (mut worker, connection) = tokio_postgres::connect(&url, NoTls).await?;
+        // Termination is expected here, unlike the ordinary test connection helper.
+        let connection_task = tokio::spawn(connection);
+        let pid: i32 = worker
+            .query_one("select pg_backend_pid()", &[])
+            .await?
+            .get(0);
+        let id = submit(&worker, &workflow, "key", &json!(null)).await?;
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let action_calls = std::cell::Cell::new(0);
+        let execute = run_one(
+            &mut worker,
+            &workflow,
+            async |job, steps| {
+                if phase == "once" {
+                    steps
+                        .step_once("action", async || {
+                            action_calls.set(action_calls.get() + 1);
+                            started.send(()).unwrap();
+                            released.await?;
+                            Ok(json!(42))
+                        })
+                        .await?;
+                } else if phase == "uncommitted" {
+                    steps
+                        .step("action", async |tx| {
+                            tx.execute("insert into disconnected_effects values ($1)", &[&job.id])
+                                .await?;
+                            started.send(()).unwrap();
+                            released.await?;
+                            Ok(json!(42))
+                        })
+                        .await?;
+                } else {
+                    steps
+                        .step("action", async |tx| {
+                            tx.execute("insert into disconnected_effects values ($1)", &[&job.id])
+                                .await?;
+                            Ok(json!(42))
+                        })
+                        .await?;
+                    started.send(()).unwrap();
+                    released.await?;
+                }
+                Ok(json!(42))
+            },
+            retry_now,
+        );
+        let terminate = async {
+            ready.await?;
+            assert!(
+                observer
+                    .query_one("select pg_terminate_backend($1, 5000)", &[&pid])
+                    .await?
+                    .get::<_, bool>(0)
+            );
+            assert!(connection_task.await?.is_err());
+            release.send(()).unwrap();
+            Ok::<_, resume::Error>(())
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            let (result, terminated) = tokio::join!(execute, terminate);
+            terminated?;
+            Ok::<_, resume::Error>((result, ()))
+        })
+        .await??;
+        assert!(result.is_err());
+        assert!(worker.is_closed());
+        let effects: i64 = observer
+            .query_one(
+                "select count(*) from disconnected_effects where job_id = $1",
+                &[&id],
+            )
+            .await?
+            .get(0);
+        assert_eq!(effects, i64::from(phase == "committed"));
+        let steps: i64 = observer
+            .query_one(
+                "select count(*) from resume.steps where job_id = $1",
+                &[&id],
+            )
+            .await?
+            .get(0);
+        assert_eq!(steps, i64::from(phase != "uncommitted"));
+        // A dead connection cannot record failure or its retry policy. The claim expires.
+        assert!(
+            !run_one(
+                &mut observer,
+                &workflow,
+                async |_, _| panic!("claimed before expiry"),
+                retry_now
+            )
+            .await?
+        );
+        due(&observer, id).await;
+        let recovered = run_one(
+            &mut observer,
+            &workflow,
+            async |job, steps| {
+                assert_eq!(job.attempt, 2);
+                assert_eq!(job.failures, 0);
+                if phase == "once" {
+                    steps
+                        .step_once("action", async || panic!("repeated uncertain action"))
+                        .await?;
+                } else {
+                    steps
+                        .step("action", async |tx| {
+                            assert_eq!(phase, "uncommitted", "repeated committed database effect");
+                            tx.execute("insert into disconnected_effects values ($1)", &[&job.id])
+                                .await?;
+                            Ok(json!(42))
+                        })
+                        .await?;
+                }
+                Ok(json!(42))
+            },
+            |_, _| Retry::Stop,
+        )
+        .await;
+        if phase == "once" {
+            assert!(db_message(&recovered.unwrap_err()).contains("unknown"));
+            assert_eq!(action_calls.get(), 1);
+            assert_eq!(status(&observer, id).await, "paused");
+        } else {
+            assert!(recovered?);
+            assert_eq!(status(&observer, id).await, "completed");
+            assert_eq!(
+                observer
+                    .query_one(
+                        "select count(*) from disconnected_effects where job_id = $1",
+                        &[&id]
+                    )
+                    .await?
+                    .get::<_, i64>(0),
+                1
+            );
+        }
+        assert!(
+            observer
+                .execute("select resume.save_step($1, 1, 'action', '99')", &[&id])
+                .await
+                .is_err()
+        );
+    }
     Ok(())
 }

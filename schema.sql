@@ -14,6 +14,11 @@ create table resume.jobs (
     completed boolean not null default false,
     paused boolean not null default false,
     last_error text,
+    saga_phase text check (saga_phase in ('forward', 'compensating', 'completed', 'compensated')),
+    -- Compensation's starting position while active; saga's end position once terminal.
+    saga_position integer,
+    -- Successful output, or the durable reason for compensation.
+    saga_result jsonb,
     unique (workflow, key)
 );
 
@@ -24,6 +29,8 @@ create table resume.steps (
     key text not null check (key <> ''),
     position integer not null check (position >= 0),
     once boolean not null,
+    compensation text check (compensation <> ''),
+    is_compensation boolean not null default false,
     -- SQL null means started but unresolved; JSON null is a completed output.
     output jsonb,
     primary key (job_id, key),
@@ -43,7 +50,7 @@ select id, workflow, key, attempt,
         when available_at > statement_timestamp() then 'scheduled'
         else 'ready'
     end as status,
-    available_at, last_error
+    available_at, last_error, parent_id, failures, saga_phase, saga_result
 from resume.jobs;
 
 -- A missing output during an active call is normal, not evidence of a stuck job.
@@ -110,15 +117,37 @@ $$;
 -- Validate history before any action. Regular steps roll this marker back on failure;
 -- step_once commits it before invoking the action.
 create function resume.start_step(p_id bigint, p_attempt bigint, p_key text,
-    p_position integer, p_once boolean)
+    p_position integer, p_once boolean, p_compensation text default null,
+    p_is_compensation boolean default false)
 returns jsonb language plpgsql as $$
 declare
     v_step resume.steps;
+    v_job resume.jobs;
+    v_expected text;
 begin
     perform resume.begin_step(p_id, p_attempt);
+    select * into v_job from resume.jobs where id = p_id;
+    if p_is_compensation then
+        if v_job.saga_phase is distinct from 'compensating' or p_once or p_compensation is not null
+            or p_position < v_job.saga_position then
+            raise exception 'invalid compensation state' using errcode = 'RS002';
+        end if;
+        select format('$undo:%s:%s', position, compensation) into v_expected
+        from resume.steps where job_id = p_id and compensation is not null
+        order by position desc offset (p_position - v_job.saga_position) limit 1;
+        if v_expected is null or p_key is distinct from v_expected then
+            raise exception 'compensations must follow reverse step order' using errcode = 'RS002';
+        end if;
+    elsif v_job.saga_phase = 'compensating' or p_key like '$undo:%' then
+        raise exception 'forward steps cannot run during compensation' using errcode = 'RS002';
+    end if;
+    if p_compensation is not null and v_job.saga_phase is distinct from 'forward' then
+        raise exception 'compensation registration requires an active saga' using errcode = 'RS002';
+    end if;
     if exists (select 1 from resume.steps where job_id = p_id
         and (key = p_key or position = p_position)
-        and (key <> p_key or position <> p_position or once <> p_once)) then
+        and (key <> p_key or position <> p_position or once <> p_once
+            or compensation is distinct from p_compensation or is_compensation <> p_is_compensation)) then
         raise exception 'step history differs at position %: %', p_position, p_key using errcode = 'RS002';
     end if;
     if exists (select 1 from resume.steps where job_id = p_id
@@ -129,7 +158,8 @@ begin
     if found then
         return v_step.output;
     end if;
-    insert into resume.steps (job_id, key, position, once) values (p_id, p_key, p_position, p_once);
+    insert into resume.steps (job_id, key, position, once, compensation, is_compensation)
+    values (p_id, p_key, p_position, p_once, p_compensation, p_is_compensation);
     return null;
 end;
 $$;
@@ -174,6 +204,10 @@ begin
         and leased and not completed and available_at > clock_timestamp() for update;
     if not found then
         raise exception 'job claim is no longer valid' using errcode = 'RS001';
+    end if;
+    if p_error is null and exists (select 1 from resume.jobs where id = p_id
+        and saga_phase in ('forward', 'compensating')) then
+        raise exception 'cannot complete an unfinished saga' using errcode = 'RS002';
     end if;
     if p_error is null and (p_position is null or p_position < 0 or exists (
         select 1 from resume.steps where job_id = p_id
@@ -290,6 +324,59 @@ begin
     update resume.jobs
     set paused = false, leased = false,
         available_at = clock_timestamp() + make_interval(secs => p_delay_seconds)
+    where id = p_id;
+end;
+$$;
+
+-- One sequential saga per job. Names in steps.compensation are part of replay history.
+create function resume.begin_saga(p_id bigint, p_attempt bigint)
+returns setof resume.jobs language plpgsql as $$
+begin
+    perform resume.begin_step(p_id, p_attempt);
+    if exists (select 1 from resume.jobs where id = p_id and saga_phase is null) then
+        if exists (select 1 from resume.steps where job_id = p_id) then
+            raise exception 'saga must start before any ordinary steps' using errcode = 'RS002';
+        end if;
+        update resume.jobs set saga_phase = 'forward' where id = p_id;
+    end if;
+    return query select * from resume.jobs where id = p_id;
+end;
+$$;
+
+-- Commit the decision before any compensation. Unknown effects cannot be guessed away.
+create function resume.compensate(p_id bigint, p_attempt bigint, p_position integer, p_reason jsonb)
+returns void language plpgsql as $$
+begin
+    perform resume.begin_step(p_id, p_attempt);
+    if p_reason is null or p_position is null or p_position < 0
+        or not exists (select 1 from resume.jobs where id = p_id and saga_phase = 'forward')
+        or exists (select 1 from resume.steps where job_id = p_id and (output is null or position >= p_position)) then
+        raise exception 'cannot compensate: invalid state, unknown or omitted steps' using errcode = 'RS002';
+    end if;
+    update resume.jobs set saga_phase = 'compensating', saga_position = p_position,
+        saga_result = p_reason where id = p_id;
+end;
+$$;
+
+create function resume.end_saga(p_id bigint, p_attempt bigint, p_position integer, p_output jsonb)
+returns void language plpgsql as $$
+declare
+    v_phase text;
+begin
+    perform resume.begin_step(p_id, p_attempt);
+    select saga_phase into v_phase from resume.jobs where id = p_id;
+    if v_phase is null or v_phase not in ('forward', 'compensating')
+        or p_position is null or p_position < 0 or p_output is null
+        or exists (select 1 from resume.steps where job_id = p_id and (output is null or position >= p_position)) then
+        raise exception 'cannot finish saga: invalid state, unknown or omitted steps' using errcode = 'RS002';
+    end if;
+    if v_phase = 'compensating' and
+        (select count(*) from resume.steps where job_id = p_id and compensation is not null) <>
+        (select count(*) from resume.steps where job_id = p_id and is_compensation and output is not null) then
+        raise exception 'cannot finish saga: compensations remain' using errcode = 'RS002';
+    end if;
+    update resume.jobs set saga_phase = case when v_phase = 'forward' then 'completed' else 'compensated' end,
+        saga_position = p_position, saga_result = case when v_phase = 'forward' then p_output else saga_result end
     where id = p_id;
 end;
 $$;

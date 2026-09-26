@@ -1,0 +1,5 @@
+{"id":"evt-1","account":"alice","amount_cents":1250}
+{"id":"evt-2","account":"bob","amount_cents":-500}
+{"id":"evt-1","account":"alice","amount_cents":1250}
+{"id":"evt-1","account":"alice","amount_cents":9999}
+{"id":"bad-row","account":"bob","amount_cents":"not an integer"}
