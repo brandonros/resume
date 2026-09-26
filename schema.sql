@@ -27,6 +27,30 @@ create table resume.steps (
     unique (job_id, position)
 );
 
+-- Operational snapshot. Expired leases may still have a transaction holding the row lock.
+-- Filter status = 'paused', or order by attempt desc to inspect repeated claims.
+create view resume.job_status as
+select id, workflow, key, attempt,
+    case
+        when completed then 'completed'
+        when paused then 'paused'
+        when leased and available_at > statement_timestamp() then 'running'
+        when leased then 'lease_expired'
+        when available_at > statement_timestamp() then 'scheduled'
+        else 'ready'
+    end as status,
+    available_at, last_error
+from resume.jobs;
+
+-- A missing output during an active call is normal, not evidence of a stuck job.
+-- Inspect the external outcome before resolving; lease expiry does not prove the call stopped.
+create view resume.unresolved_steps as
+select j.id as job_id, j.workflow, j.key as job_key, j.attempt, j.status,
+    j.available_at, j.last_error, s.key as step_key, s.position
+from resume.job_status j
+join resume.steps s on s.job_id = j.id
+where s.once and s.output is null;
+
 -- The no-op update validates duplicate input without restarting the job.
 create function resume.submit(p_workflow text, p_key text, p_input jsonb)
 returns bigint language plpgsql as $$

@@ -40,6 +40,8 @@ pub async fn submit(
 
 /// Process at most one job; return false when none is ready, true on completion.
 /// Handler or completion errors go to `retry`; the decision is saved before returning the error.
+/// The callback receives the original error: use `downcast_ref` to classify application or
+/// database errors, returning Stop for permanent failures and After for retryable ones.
 /// Stop pauses the job; After schedules another attempt. The callback does not run on success
 /// or idle polls. Database failures propagate; abandoned claims recover at lease expiry without
 /// consulting this callback, so an application attempt limit is not a strict crash limit.

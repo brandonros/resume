@@ -391,6 +391,80 @@ async fn application_controls_retry_count_and_receives_original_error() -> Resul
 
 #[tokio::test]
 #[ignore = "requires a disposable database with schema.sql installed"]
+async fn retry_policy_distinguishes_transient_permanent_and_unknown_errors() -> Result<()> {
+    use std::io::{Error, ErrorKind};
+
+    let mut client = connect().await;
+    for (label, kind) in [
+        ("transient", Some(ErrorKind::TimedOut)),
+        ("permanent", Some(ErrorKind::InvalidInput)),
+        ("unknown", None),
+    ] {
+        let workflow = format!("error-class-{label}");
+        let id = submit(&client, &workflow, "key", &json!(null)).await?;
+        let error = run_one(
+            &mut client,
+            &workflow,
+            async |_, steps| {
+                steps
+                    .step("action", async |_| {
+                        // Identical messages: classification must use the error's type/kind.
+                        match kind {
+                            Some(kind) => Err(Error::new(kind, "action failed").into()),
+                            None => Err("action failed".into()),
+                        }
+                    })
+                    .await?;
+                Ok(())
+            },
+            |_, error| {
+                if error
+                    .downcast_ref::<Error>()
+                    .is_some_and(|error| error.kind() == ErrorKind::TimedOut)
+                {
+                    Retry::After(Duration::ZERO)
+                } else {
+                    Retry::Stop
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.downcast_ref::<Error>().map(Error::kind), kind);
+        assert_eq!(error.to_string(), "action failed");
+        let row = client
+            .query_one(
+                "select paused, leased, completed, last_error from resume.jobs where id = $1",
+                &[&id],
+            )
+            .await?;
+        let retryable = kind == Some(ErrorKind::TimedOut);
+        assert_eq!(row.get::<_, bool>(0), !retryable);
+        assert!(!row.get::<_, bool>(1));
+        assert!(!row.get::<_, bool>(2));
+        assert_eq!(row.get::<_, &str>(3), "action failed");
+        due(&client, id).await;
+        assert_eq!(
+            run_one(
+                &mut client,
+                &workflow,
+                async |job, steps| {
+                    assert!(retryable, "permanent or unclassified failure was retried");
+                    assert_eq!(job.attempt, 2);
+                    steps.step("action", async |_| Ok(json!(42))).await?;
+                    Ok(())
+                },
+                |_, _| panic!("unexpected failure during recovery"),
+            )
+            .await?,
+            retryable
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable database with schema.sql installed"]
 async fn application_selects_delay_per_failure_and_sql_rejects_invalid_delays() -> Result<()> {
     let mut client = connect().await;
     let id = submit(&client, "delayed", "key", &json!(null)).await?;

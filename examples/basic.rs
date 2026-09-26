@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use resume::{Result, Retry, run_one, submit};
 use serde_json::json;
-use tokio_postgres::NoTls;
+use tokio_postgres::{NoTls, error::SqlState};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -34,8 +34,17 @@ async fn main() -> Result<()> {
                     .await?;
                 Ok(())
             },
-            |job, _| {
-                if job.attempt < 4 {
+            |job, error| {
+                // Retry known transient database failures. Invalid input, unknown
+                // outcomes, and unclassified errors pause for inspection.
+                let transient = error
+                    .downcast_ref::<tokio_postgres::Error>()
+                    .and_then(|error| error.code())
+                    .is_some_and(|code| {
+                        *code == SqlState::T_R_SERIALIZATION_FAILURE
+                            || *code == SqlState::T_R_DEADLOCK_DETECTED
+                    });
+                if transient && job.attempt < 4 {
                     Retry::After(Duration::from_secs(1))
                 } else {
                     Retry::Stop
