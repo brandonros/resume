@@ -5,7 +5,10 @@ create table resume.jobs (
     workflow text not null check (workflow <> ''),
     key text not null check (key <> ''),
     input jsonb not null,
+    parent_id bigint references resume.jobs (id),
+    output jsonb,
     attempt bigint not null default 0,
+    failures bigint not null default 0,
     leased boolean not null default false,
     available_at timestamptz not null default clock_timestamp(),
     completed boolean not null default false,
@@ -36,6 +39,7 @@ select id, workflow, key, attempt,
         when paused then 'paused'
         when leased and available_at > statement_timestamp() then 'running'
         when leased then 'lease_expired'
+        when available_at = 'infinity' then 'waiting'
         when available_at > statement_timestamp() then 'scheduled'
         else 'ready'
     end as status,
@@ -52,15 +56,17 @@ join resume.steps s on s.job_id = j.id
 where s.once and s.output is null;
 
 -- The no-op update validates duplicate input without restarting the job.
-create function resume.submit(p_workflow text, p_key text, p_input jsonb)
+-- A duplicate keeps its original schedule.
+create function resume.submit(p_workflow text, p_key text, p_input jsonb,
+    p_available_at timestamptz default null, p_parent_id bigint default null)
 returns bigint language plpgsql as $$
 declare
     v_id bigint;
 begin
-    insert into resume.jobs (workflow, key, input)
-    values (p_workflow, p_key, p_input)
+    insert into resume.jobs (workflow, key, input, parent_id, available_at)
+    values (p_workflow, p_key, p_input, p_parent_id, coalesce(p_available_at, clock_timestamp()))
     on conflict (workflow, key) do update set key = excluded.key
-        where jobs.input = excluded.input
+        where jobs.input = excluded.input and jobs.parent_id is not distinct from excluded.parent_id
     returning id into v_id;
     if not found then
         raise exception 'idempotency key has different input' using errcode = '23505';
@@ -154,9 +160,12 @@ end;
 $$;
 
 -- Atomically record failure and the application decision: NULL delay pauses, otherwise schedule.
+-- Completion stores the output and wakes a waiting parent.
 create function resume.finish(p_id bigint, p_attempt bigint, p_error text, p_position integer default 0,
-    p_retry_after_seconds double precision default null)
+    p_retry_after_seconds double precision default null, p_output jsonb default null)
 returns void language plpgsql as $$
+declare
+    v_parent bigint;
 begin
     if p_retry_after_seconds < 0 or p_retry_after_seconds >= 'Infinity'::double precision then
         raise exception 'retry delay must be finite and nonnegative' using errcode = '22023';
@@ -174,13 +183,64 @@ begin
     end if;
     update resume.jobs
     set completed = p_error is null, leased = false, last_error = p_error,
+        output = case when p_error is null then coalesce(p_output, 'null') end,
+        failures = failures + (p_error is not null)::int,
         paused = p_error is not null and p_retry_after_seconds is null,
         available_at = clock_timestamp() + make_interval(secs => coalesce(p_retry_after_seconds, 0))
     where id = p_id and attempt = p_attempt and leased and not completed
-        and available_at > clock_timestamp();
+        and available_at > clock_timestamp()
+    returning parent_id into v_parent;
     if not found then
         raise exception 'job claim is no longer valid' using errcode = 'RS001';
     end if;
+    if p_error is null and v_parent is not null then
+        -- Lock even if the parent is leased: its wait_for then sees this completion.
+        perform 1 from resume.jobs where id = v_parent for update;
+        update resume.jobs set available_at = clock_timestamp()
+        where id = v_parent and not leased and not completed and not paused
+            and available_at = 'infinity';
+    end if;
+end;
+$$;
+
+-- Release the claim until p_until, keeping saved steps. Returns false if already due.
+create function resume.suspend(p_id bigint, p_attempt bigint, p_until timestamptz)
+returns boolean language plpgsql as $$
+begin
+    perform 1 from resume.jobs where id = p_id and attempt = p_attempt
+        and leased and not completed and available_at > clock_timestamp() for update;
+    if not found then
+        raise exception 'job claim is no longer valid' using errcode = 'RS001';
+    end if;
+    if p_until <= clock_timestamp() then
+        return false;
+    end if;
+    update resume.jobs set leased = false, available_at = p_until where id = p_id;
+    return true;
+end;
+$$;
+
+-- Return a completed child's output, or release the claim until the child completes
+-- and return SQL null. The parent lock orders this check against the child's finish.
+create function resume.wait_for(p_id bigint, p_attempt bigint, p_child bigint)
+returns jsonb language plpgsql as $$
+declare
+    v_child resume.jobs;
+begin
+    perform 1 from resume.jobs where id = p_id and attempt = p_attempt
+        and leased and not completed and available_at > clock_timestamp() for update;
+    if not found then
+        raise exception 'job claim is no longer valid' using errcode = 'RS001';
+    end if;
+    select * into v_child from resume.jobs where id = p_child and parent_id = p_id;
+    if not found then
+        raise exception 'job % is not a child of job %', p_child, p_id using errcode = 'RS002';
+    end if;
+    if v_child.completed then
+        return v_child.output;
+    end if;
+    update resume.jobs set leased = false, available_at = 'infinity' where id = p_id;
+    return null;
 end;
 $$;
 

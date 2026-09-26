@@ -15,7 +15,7 @@ async fn connect() -> Result<Client> {
     Ok(client)
 }
 
-async fn checkout(job: &Job, steps: &mut Steps<'_>, service: &Client) -> Result<()> {
+async fn checkout(job: &Job, steps: &mut Steps<'_>, service: &Client) -> Result<Value> {
     steps
         .step("create-order", async |tx| {
             // A replayed INSERT would fail the primary key constraint.
@@ -47,7 +47,7 @@ async fn checkout(job: &Job, steps: &mut Steps<'_>, service: &Client) -> Result<
             Ok(json!(null))
         })
         .await?;
-    Ok(())
+    Ok(Value::Null)
 }
 
 #[tokio::main(flavor = "current_thread")]

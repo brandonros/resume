@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use resume::{Result, Retry, run_one, submit};
+use resume::{Result, Retry, run_one, submit, submit_at};
 use serde_json::json;
 use tokio_postgres::{Client, NoTls};
 
@@ -91,7 +91,7 @@ async fn failure_rolls_back_and_retry_replays_saved_output() -> Result<()> {
                     Err("try again".into())
                 })
                 .await?;
-            Ok(())
+            Ok(json!(null))
         },
         |_, _| Retry::After(Duration::from_secs(1)),
     )
@@ -131,7 +131,7 @@ async fn failure_rolls_back_and_retry_replays_saved_output() -> Result<()> {
                         Ok(json!(42))
                     })
                     .await?;
-                Ok(())
+                Ok(json!(null))
             },
             retry_now
         )
@@ -249,7 +249,7 @@ async fn dropping_a_handler_keeps_saved_progress_for_recovery() -> Result<()> {
                         std::future::pending().await
                     })
                     .await?;
-                Ok(())
+                Ok(json!(null))
             },
             retry_now,
         );
@@ -278,7 +278,7 @@ async fn dropping_a_handler_keeps_saved_progress_for_recovery() -> Result<()> {
                     json!(7)
                 );
                 steps.step("unfinished", async |_| Ok(json!(8))).await?;
-                Ok(())
+                Ok(json!(null))
             },
             retry_now
         )
@@ -300,7 +300,7 @@ async fn duplicate_step_keys_release_the_attempt_with_an_error() -> Result<()> {
             steps
                 .step("same", async |_| panic!("ran a duplicate step"))
                 .await?;
-            Ok(())
+            Ok(json!(null))
         },
         retry_now,
     )
@@ -363,7 +363,7 @@ async fn application_controls_retry_count_and_receives_original_error() -> Resul
         run_one(
             &mut client,
             "policy-success",
-            async |_, _| Ok(()),
+            async |_, _| Ok(json!(null)),
             |_, _| panic!("policy on success")
         )
         .await?
@@ -380,7 +380,7 @@ async fn application_controls_retry_count_and_receives_original_error() -> Resul
             "policy-crash",
             async |job, _| {
                 assert_eq!(job.attempt, 7);
-                Ok(())
+                Ok(json!(null))
             },
             |_, _| panic!("policy on recovered success")
         )
@@ -415,7 +415,7 @@ async fn retry_policy_distinguishes_transient_permanent_and_unknown_errors() -> 
                         }
                     })
                     .await?;
-                Ok(())
+                Ok(json!(null))
             },
             |_, error| {
                 if error
@@ -452,7 +452,7 @@ async fn retry_policy_distinguishes_transient_permanent_and_unknown_errors() -> 
                     assert!(retryable, "permanent or unclassified failure was retried");
                     assert_eq!(job.attempt, 2);
                     steps.step("action", async |_| Ok(json!(42))).await?;
-                    Ok(())
+                    Ok(json!(null))
                 },
                 |_, _| panic!("unexpected failure during recovery"),
             )
@@ -549,7 +549,7 @@ async fn positions_reject_changed_history_and_allow_a_new_suffix() -> Result<()>
                 steps
                     .step(key, async |_| panic!("executed changed history"))
                     .await?;
-                Ok(())
+                Ok(json!(null))
             },
             retry_now,
         )
@@ -564,7 +564,7 @@ async fn positions_reject_changed_history_and_allow_a_new_suffix() -> Result<()>
             steps
                 .step_once("first", async || panic!("changed regular step to once"))
                 .await?;
-            Ok(())
+            Ok(json!(null))
         },
         retry_now,
     )
@@ -578,7 +578,7 @@ async fn positions_reject_changed_history_and_allow_a_new_suffix() -> Result<()>
             steps
                 .step("first", async |_| panic!("repeated saved action"))
                 .await?;
-            Ok(()) // Missing the recorded suffix must not complete the job.
+            Ok(json!(null)) // Missing the recorded suffix must not complete the job.
         },
         retry_now,
     )
@@ -609,7 +609,7 @@ async fn positions_reject_changed_history_and_allow_a_new_suffix() -> Result<()>
                     json!(2)
                 );
                 steps.step("third", async |_| Ok(json!(3))).await?;
-                Ok(())
+                Ok(json!(null))
             },
             retry_now
         )
@@ -647,7 +647,7 @@ async fn step_once_replays_json_null_without_repeating_the_action() -> Result<()
                         .await?,
                     json!(null)
                 );
-                Ok(())
+                Ok(json!(null))
             },
             retry_now
         )
@@ -678,7 +678,7 @@ async fn swallowed_once_error_blocks_later_actions_and_completion() -> Result<()
                     .await
                     .is_err()
             );
-            Ok(())
+            Ok(json!(null))
         },
         retry_now,
     )
@@ -695,7 +695,7 @@ async fn swallowed_once_error_blocks_later_actions_and_completion() -> Result<()
             steps
                 .step_once("send", async || panic!("repeated unknown action"))
                 .await?;
-            Ok(())
+            Ok(json!(null))
         },
         retry_now,
     )
@@ -703,9 +703,14 @@ async fn swallowed_once_error_blocks_later_actions_and_completion() -> Result<()
     .unwrap_err();
     assert!(db_message(&error).contains("unknown"));
     assert!(
-        run_one(&mut client, "once-error", async |_, _| Ok(()), retry_now)
-            .await
-            .is_err()
+        run_one(
+            &mut client,
+            "once-error",
+            async |_, _| Ok(json!(null)),
+            retry_now
+        )
+        .await
+        .is_err()
     );
     assert!(client.query_one("select not completed and (select output is null from resume.steps where job_id = $1 and key = 'send') from resume.jobs where id = $1", &[&id]).await?.get::<_, bool>(0));
     Ok(())
@@ -728,7 +733,7 @@ async fn dropping_a_once_action_keeps_the_start_marker() -> Result<()> {
                         std::future::pending().await
                     })
                     .await?;
-                Ok(())
+                Ok(json!(null))
             },
             retry_now,
         );
@@ -745,7 +750,7 @@ async fn dropping_a_once_action_keeps_the_start_marker() -> Result<()> {
             steps
                 .step_once("send", async || panic!("repeated interrupted action"))
                 .await?;
-            Ok(())
+            Ok(json!(null))
         },
         retry_now,
     )
@@ -774,7 +779,7 @@ async fn once_action_releases_the_lock_and_cannot_save_after_reclaim() -> Result
                     Ok(json!(42))
                 })
                 .await?;
-            Ok(())
+            Ok(json!(null))
         },
         retry_now,
     );
@@ -827,7 +832,7 @@ async fn a_timed_out_once_action_is_never_invoked_again() -> Result<()> {
             steps
                 .step_once("send", async || std::future::pending().await)
                 .await?;
-            Ok(())
+            Ok(json!(null))
         },
         retry_now,
     )
@@ -841,7 +846,7 @@ async fn a_timed_out_once_action_is_never_invoked_again() -> Result<()> {
             steps
                 .step_once("send", async || panic!("repeated timed-out action"))
                 .await?;
-            Ok(())
+            Ok(json!(null))
         },
         retry_now,
     )
@@ -865,7 +870,7 @@ async fn resolving_records_the_outcome_but_requires_explicit_requeue() -> Result
                 steps
                     .step_once("send", async || Err("response lost".into()))
                     .await?;
-                Ok(())
+                Ok(json!(null))
             },
             retry_now
         )
@@ -954,7 +959,7 @@ async fn resolving_records_the_outcome_but_requires_explicit_requeue() -> Result
                     json!(null)
                 );
                 steps.step("after", async |_| Ok(json!(2))).await?;
-                Ok(())
+                Ok(json!(null))
             },
             retry_now
         )
@@ -1059,7 +1064,7 @@ async fn requeue_is_transactional_and_preserves_saved_steps() -> Result<()> {
                         .await?,
                     json!(7)
                 );
-                Ok(())
+                Ok(json!(null))
             },
             retry_now
         )
@@ -1162,5 +1167,164 @@ async fn operator_actions_fence_expired_workers_and_reject_active_claims() -> Re
             .await
             .is_err()
     );
+    Ok(())
+}
+
+async fn status(client: &Client, id: i64) -> String {
+    client
+        .query_one("select status from resume.job_status where id = $1", &[&id])
+        .await
+        .unwrap()
+        .get(0)
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable database with schema.sql installed"]
+async fn sleep_releases_the_claim_and_resumes_without_consulting_retry() -> Result<()> {
+    let mut client = connect().await;
+    let id = submit(&client, "sleep", "key", &json!(null)).await?;
+    let before = std::cell::Cell::new(0);
+    let handler = async |_: &resume::Job, steps: &mut resume::Steps<'_>| {
+        steps.step("before", async |_| Ok(json!(null))).await?;
+        before.set(before.get() + 1);
+        steps.sleep("nap", Duration::from_secs(60)).await?;
+        Ok(json!("woke"))
+    };
+    let no_retry =
+        |_: &resume::Job, _: &resume::Error| -> Retry { panic!("suspension is not a failure") };
+    assert!(run_one(&mut client, "sleep", &handler, no_retry).await?);
+    assert_eq!(status(&client, id).await, "scheduled");
+    assert!(!run_one(&mut client, "sleep", &handler, no_retry).await?);
+    // Claiming early replays the saved wake time and sleeps again.
+    due(&client, id).await;
+    assert!(run_one(&mut client, "sleep", &handler, no_retry).await?);
+    assert_eq!(status(&client, id).await, "scheduled");
+    client
+        .execute("update resume.steps set output = to_jsonb(clock_timestamp()) where job_id = $1 and key = 'nap'", &[&id])
+        .await?;
+    due(&client, id).await;
+    assert!(run_one(&mut client, "sleep", &handler, no_retry).await?);
+    assert_eq!(before.get(), 3);
+    let row = client
+        .query_one(
+            "select completed, output, failures, attempt from resume.jobs where id = $1",
+            &[&id],
+        )
+        .await?;
+    assert!(row.get::<_, bool>(0));
+    assert_eq!(row.get::<_, serde_json::Value>(1), json!("woke"));
+    assert_eq!(row.get::<_, i64>(2), 0);
+    assert_eq!(row.get::<_, i64>(3), 3);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable database with schema.sql installed"]
+async fn a_swallowed_suspension_blocks_later_steps_and_completion() -> Result<()> {
+    let mut client = connect().await;
+    let id = submit(&client, "swallow-sleep", "key", &json!(null)).await?;
+    assert!(
+        run_one(
+            &mut client,
+            "swallow-sleep",
+            async |_, steps| {
+                let _ = steps.sleep("nap", Duration::from_secs(60)).await;
+                let later = steps.step("later", async |_| Ok(json!(null))).await;
+                assert!(later.unwrap_err().is::<resume::Suspended>());
+                Ok(json!(null))
+            },
+            retry_now,
+        )
+        .await?
+    );
+    let row = client
+        .query_one("select completed, (select count(*) from resume.steps where job_id = $1) from resume.jobs where id = $1", &[&id])
+        .await?;
+    assert!(!row.get::<_, bool>(0));
+    assert_eq!(row.get::<_, i64>(1), 1);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable database with schema.sql installed"]
+async fn submit_at_delays_claims_and_duplicates_keep_the_schedule() -> Result<()> {
+    let mut client = connect().await;
+    let later = std::time::SystemTime::now() + Duration::from_secs(3600);
+    let id = submit_at(&client, "at", "key", &json!(1), later).await?;
+    assert_eq!(id, submit(&client, "at", "key", &json!(1)).await?);
+    assert_eq!(status(&client, id).await, "scheduled");
+    assert!(
+        !run_one(
+            &mut client,
+            "at",
+            async |_, _| panic!("claimed early"),
+            retry_now
+        )
+        .await?
+    );
+    due(&client, id).await;
+    assert!(run_one(&mut client, "at", async |_, _| Ok(json!(null)), retry_now).await?);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable database with schema.sql installed"]
+async fn parents_wait_for_spawned_children_and_wake_on_completion() -> Result<()> {
+    let mut client = connect().await;
+    let parent = submit(&client, "parent", "key", &json!(null)).await?;
+    let spawned = std::cell::RefCell::new(Vec::new());
+    let handler = async |_: &resume::Job, steps: &mut resume::Steps<'_>| {
+        let a = steps.spawn("a", "child", &json!(2)).await?;
+        let b = steps.spawn("b", "child", &json!(3)).await?;
+        spawned.borrow_mut().push((a, b));
+        let x = steps.wait_for(a).await?;
+        let y = steps.wait_for(b).await?;
+        Ok(json!(x.as_i64().unwrap() + y.as_i64().unwrap()))
+    };
+    let child = async |job: &resume::Job, _: &mut resume::Steps<'_>| {
+        Ok(json!(job.input.as_i64().unwrap() * 10))
+    };
+    assert!(run_one(&mut client, "parent", &handler, retry_now).await?);
+    assert_eq!(status(&client, parent).await, "waiting");
+    let (a, b) = spawned.borrow()[0];
+    let key: String = client
+        .query_one("select key from resume.jobs where id = $1", &[&a])
+        .await?
+        .get(0);
+    assert_eq!(key, format!("{parent}/a"));
+
+    assert!(run_one(&mut client, "child", &child, retry_now).await?);
+    assert_eq!(status(&client, parent).await, "ready");
+    assert!(run_one(&mut client, "parent", &handler, retry_now).await?);
+    assert_eq!(status(&client, parent).await, "waiting");
+    assert!(run_one(&mut client, "child", &child, retry_now).await?);
+    assert!(run_one(&mut client, "parent", &handler, retry_now).await?);
+    assert_eq!(*spawned.borrow(), vec![(a, b); 3]);
+    let output: serde_json::Value = client
+        .query_one(
+            "select output from resume.jobs where id = $1 and completed",
+            &[&parent],
+        )
+        .await?
+        .get(0);
+    assert_eq!(output, json!(50));
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable database with schema.sql installed"]
+async fn wait_for_rejects_jobs_that_are_not_children() -> Result<()> {
+    let mut client = connect().await;
+    let other = submit(&client, "stranger", "key", &json!(null)).await?;
+    submit(&client, "not-parent", "key", &json!(null)).await?;
+    let error = run_one(
+        &mut client,
+        "not-parent",
+        async |_, steps| steps.wait_for(other).await,
+        |_, _| Retry::Stop,
+    )
+    .await
+    .unwrap_err();
+    assert!(db_message(&error).contains("is not a child"));
     Ok(())
 }
