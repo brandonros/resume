@@ -6,8 +6,8 @@ From the repository root:
 just check
 ```
 
-This creates a temporary PostgreSQL database, installs the framework schema, runs all
-34 scenarios, and drops the database on exit. An assertion failure or timeout makes
+This creates a temporary PostgreSQL database, installs the framework schema, runs every
+scenario, and drops the database on exit. An assertion failure or timeout makes
 the command fail. It does not touch your application database.
 
 The scenarios cover:
@@ -19,6 +19,7 @@ The scenarios cover:
 - Scheduling: delays, absolute timestamps, duplicate submissions, and deadlines.
 - Snooze: released locks, saved progress, retry counts, and deadlines.
 - Failure handlers: atomic dispatch, terminal failure paths, saved cleanup progress, and lost results.
+- Completion and unknown outcomes: rejected completion after a swallowed or unreached step, immediate failure after a step_once error, results kept when cancelled mid-call, and operator resolution.
 
 To run against an existing **disposable database** with both SQL layers installed:
 

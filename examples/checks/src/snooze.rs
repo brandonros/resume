@@ -245,7 +245,9 @@ pub(super) async fn step_once_cannot_snooze_and_repeat_its_action() {
             run_is(
                 &client,
                 run,
-                "attempt = 1 and attempts_used = 1 and last_error like '%cannot snooze%'"
+                "attempt = 1 and attempts_used = 1
+                 and last_error like 'step send started and its outcome is unknown (snooze for%'
+                 and last_error like '%use a regular step for readiness checks%'"
             )
             .await
         );

@@ -438,3 +438,118 @@ pub(super) async fn completion_rejects_unresolved_and_unvisited_steps() {
     let (result, ()) = tokio::join!(worker, observer);
     result.unwrap();
 }
+
+pub(super) async fn step_once_error_fails_the_run_without_retrying() {
+    let client = connect().await;
+    let name = workflow("once-error");
+    let run = crate::common::submit(&client, &name).await;
+    let (stop, shutdown) = oneshot::channel::<()>();
+    let worker = Worker::new(connect().await, &name, "1")
+        .poll_interval(Duration::from_millis(10))
+        .run(
+            async {
+                let _ = shutdown.await;
+            },
+            async |run| {
+                run.step_once("send", async || Err("vendor timed out".into()))
+                    .await?;
+                Ok(())
+            },
+        );
+    let observer = async {
+        wait_for(&client, run, "failed_at is not null").await;
+        // The default policy allows three attempts; the unknown outcome used one.
+        assert!(
+            run_is(
+                &client,
+                run,
+                "attempt = 1 and attempts_used = 1 and max_attempts = 3
+                 and last_error like 'step send started and its outcome is unknown (vendor timed out)%'"
+            )
+            .await
+        );
+        let resolution: bool = client
+            .query_one(
+                "select needs_resolution from resume.step_status where run_id = $1 and key = 'send'",
+                &[&run],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(resolution);
+        stop.send(()).unwrap();
+    };
+    let (result, ()) = tokio::join!(worker, observer);
+    result.unwrap();
+}
+
+pub(super) async fn cancelling_during_a_step_once_action_keeps_its_result() {
+    let client = connect().await;
+    let name = workflow("cancel-once");
+    let run = crate::common::submit(&client, &name).await;
+    let (release, gate) = oneshot::channel::<()>();
+    let gate = std::sync::Mutex::new(Some(gate));
+    let (stop, shutdown) = oneshot::channel::<()>();
+    let worker = Worker::new(connect().await, &name, "1")
+        .poll_interval(Duration::from_millis(10))
+        .run(
+            async {
+                let _ = shutdown.await;
+            },
+            async |run| {
+                run.step_once("send", async || {
+                    // Only the first call waits; a replay never calls this again.
+                    let gate = gate.lock().unwrap().take();
+                    if let Some(gate) = gate {
+                        let _ = gate.await;
+                    }
+                    Ok(json!(42))
+                })
+                .await?;
+                run.step("after", async |_| Ok(json!(true))).await?;
+                Ok(())
+            },
+        );
+    let observer = async {
+        wait_for(
+            &client,
+            run,
+            "exists (select 1 from resume.steps s where s.run_id = runs.id and s.key = 'send')",
+        )
+        .await;
+        cancel(&client, run).await;
+        release.send(()).unwrap();
+        wait_for(
+            &client,
+            run,
+            "(select completed_at is not null from resume.steps s
+              where s.run_id = runs.id and s.key = 'send')",
+        )
+        .await;
+        // The result the worker received is recorded; the run stopped before its next step.
+        let status = client
+            .query_one(
+                "select status, needs_resolution, steps_completed from resume.run_status where id = $1",
+                &[&run],
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.get::<_, String>(0), "cancelled");
+        assert!(!status.get::<_, bool>(1));
+        assert_eq!(status.get::<_, i64>(2), 1);
+        reopen(&client, run).await.unwrap();
+        wait_for(&client, run, "completed_at is not null").await;
+        assert!(
+            run_is(
+                &client,
+                run,
+                "(select output from resume.steps s where s.run_id = runs.id and s.key = 'send') = '42'
+                 and (select count(*) from resume.steps s where s.run_id = runs.id) = 2"
+            )
+            .await
+        );
+        stop.send(()).unwrap();
+    };
+    let (result, ()) = tokio::join!(worker, observer);
+    result.unwrap();
+}

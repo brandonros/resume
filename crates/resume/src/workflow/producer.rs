@@ -73,8 +73,10 @@ impl<'a, C: GenericClient> Producer<'a, C> {
         self
     }
 
-    /// Fails runs this producer creates if they have not completed within `deadline` of being
-    /// submitted, whether they are waiting or in progress.
+    /// Fails runs this producer creates once `deadline` has passed since submission, whether
+    /// they are waiting or in progress. A waiting run fails the next time a worker polls. A run
+    /// in progress fails when it starts its next step: a step already running finishes and
+    /// saves, and a run whose last step had started can still complete.
     pub fn deadline(mut self, deadline: Duration) -> Self {
         self.deadline = Some(deadline);
         self

@@ -38,7 +38,8 @@ resolve-step run key output:
 reopen-run run:
     echo "select resume.reopen_run(:'run')" | psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -v run={{quote(run)}}
 
-# For operators: stop a run that has not finished. A run in progress stops at its next step.
+# For operators: stop a run that has not finished. A run in progress stops at its next step;
+# a step already running finishes and saves its result.
 cancel-run run:
     echo "select resume.cancel_run(:'run')" | psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -v run={{quote(run)}}
 

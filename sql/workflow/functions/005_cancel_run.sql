@@ -1,5 +1,6 @@
--- Cancels an unfinished run. Waits for any step holding the row lock to finish;
--- subsequent steps and claims are rejected.
+-- Cancels an unfinished run. Waits for any step holding the row lock to finish; subsequent
+-- steps and claims are rejected. A step_once action in flight still saves its result
+-- (see save_step), so cancelling mid-call leaves nothing for an operator to resolve.
 create or replace function resume.cancel_run(p_run_id bigint)
 returns void
 language plpgsql

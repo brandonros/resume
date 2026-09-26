@@ -10,12 +10,14 @@ mod waiting;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    let mut passed = 0;
     macro_rules! check {
         ($scenario:path) => {
             println!("Checking {}", stringify!($scenario));
             tokio::time::timeout(std::time::Duration::from_secs(30), $scenario())
                 .await
                 .expect(concat!("scenario timed out: ", stringify!($scenario)));
+            passed += 1;
         };
     }
 
@@ -51,8 +53,10 @@ async fn main() {
     check!(recovery::reserved_handler_keys_cannot_be_submitted);
     check!(recovery::reopen_resolves_an_unknown_step_once_outcome);
     check!(recovery::completion_rejects_unresolved_and_unvisited_steps);
+    check!(recovery::step_once_error_fails_the_run_without_retrying);
+    check!(recovery::cancelling_during_a_step_once_action_keeps_its_result);
     check!(recovery::worker_exhaustion_queues_handler_without_step_output);
     check!(waiting::timeout_leaves_job_available_and_wait_observes_completion);
     check!(waiting::wait_reports_failure_cancellation_missing_jobs_and_query_timeout);
-    println!("All 34 checks passed.");
+    println!("All {passed} checks passed.");
 }

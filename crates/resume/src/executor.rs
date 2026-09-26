@@ -102,10 +102,11 @@ impl Job {
     }
 
     /// For external effects that must not repeat, such as a vendor without idempotency.
-    /// The action runs at most once per run. If an attempt dies or times out after starting it
-    /// and before saving its result, the outcome is unknown: the run fails instead of calling
-    /// again, and someone must check the vendor and pass the output to resume.reopen_run.
-    /// Returning `Snooze` also fails the run; use a regular step for readiness checks.
+    /// The action runs at most once per run. Once it has started, the run never calls it
+    /// again: if the attempt dies, or the action times out or returns any error (including
+    /// `Snooze`), the outcome is unknown and the run fails at once, without retrying. Someone
+    /// must check the vendor and pass the output to resume.reopen_run. Do readiness checks
+    /// and anything that may legitimately fail in a regular step before this one.
     pub async fn step_once(
         &self,
         key: &str,
@@ -122,17 +123,23 @@ impl Job {
             }
 
             tracing::info!("executing once");
-            let output = self.timed(key, action()).await.map_err(|error| {
-                if error.is::<Snooze>() {
+            // The start is committed, so a retry could never call the action again: it would
+            // only pay a backoff before begin_step fails the run for the unknown outcome.
+            let output = self
+                .timed(key, action())
+                .await
+                .map_err(|error| -> crate::Error {
+                    let hint = if error.is::<Snooze>() {
+                        "; use a regular step for readiness checks"
+                    } else {
+                        ""
+                    };
                     Permanent(format!(
-                        "step {key} cannot snooze after starting a step_once action; \
-                         its outcome is unknown; use a regular step for readiness checks"
+                        "step {key} started and its outcome is unknown ({error}){hint}; \
+                     check the effect and pass the output to resume.reopen_run"
                     ))
                     .into()
-                } else {
-                    error
-                }
-            })?;
+                })?;
 
             // save_step checks the claim itself, so this needs no transaction of its own.
             let saved = self.save_step(&*client, key, &output).await?;
