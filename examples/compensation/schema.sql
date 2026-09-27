@@ -1,11 +1,14 @@
-create schema if not exists compensation_app;
-create table if not exists compensation_app.inventory (
-    sku text primary key,
-    available bigint not null check (available >= 0)
+IF SCHEMA_ID('compensation_app') IS NULL EXEC('CREATE SCHEMA compensation_app');
+GO
+IF OBJECT_ID('compensation_app.inventory') IS NULL
+CREATE TABLE compensation_app.inventory (
+    sku nvarchar(256) PRIMARY KEY,
+    available bigint NOT NULL CHECK(available>=0)
 );
-create table if not exists compensation_app.orders (
-    job_id bigint primary key references resume.jobs(id),
-    quantity bigint not null check (quantity > 0),
-    state text not null check (state in ('reserved', 'compensated')),
-    released boolean not null default false
+IF OBJECT_ID('compensation_app.orders') IS NULL
+CREATE TABLE compensation_app.orders (
+    job_id bigint PRIMARY KEY REFERENCES resume.jobs(id),
+    quantity bigint NOT NULL CHECK(quantity>0),
+    state varchar(16) NOT NULL CHECK(state IN ('reserved','compensated')),
+    released bit NOT NULL DEFAULT 0
 );

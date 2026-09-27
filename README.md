@@ -1,3 +1,3 @@
 # resume
 
-A toy durable workflow engine.
+A small durable workflow and saga engine for C# and SQL Server.
