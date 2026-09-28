@@ -1,5 +1,18 @@
 <Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework></TargetFramework>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <PackageId>Resume</PackageId>
+    <Version>0.2.0</Version>
+    <Description>Durable workflows and sagas for .NET and SQL Server.</Description>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="Microsoft.Data.SqlClient" Version="7.0.3" />
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="6.1.4" />
+    <EmbeddedResource Include="../../schema.sql" LogicalName="Resume.schema.sql" />
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
+    <None Include="../../schema.sql" Pack="true" PackagePath="content/" />
   </ItemGroup>
 </Project>

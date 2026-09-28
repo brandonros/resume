@@ -10,7 +10,7 @@ try
     {
         case "install":
             await using (var connection = await Host.ConnectAsync(ct: stop.Token))
-                await SqlScript.ApplyAsync(new Db(connection), File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "framework.sql")));
+                await Schema.InstallAsync(connection, stop.Token);
             break;
         case "basic": await Demos.Basic(stop.Token); break;
         case "flow": await Demos.Flow(stop.Token); break;

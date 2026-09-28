@@ -14,12 +14,99 @@ public static class Contract
     static Task Expire(Db db, long id) => db.ExecAsync("UPDATE resume.jobs SET available_at=DATEADD(SECOND,-1,SYSUTCDATETIME()) WHERE id=@id", ("id", id));
     static async Task<Row> State(Db db, long id) => (await db.QueryAsync("SELECT * FROM resume.jobs WHERE id=@id", ("id", id))).Single();
     static async Task SqlError(Func<Task> action, int number) => Check.Equal((await Check.Throws<SqlException>(action)).Number, number);
-    public static async Task Install()
+    public static async Task Install(bool rcsi)
     {
         await using var c = await Host.ConnectAsync();
         // Never drop an existing schema: the caller must provide an empty disposable DB.
-        await SqlScript.ApplyAsync(new Db(c), File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "schema.sql")));
+        if (rcsi) await new Db(c).ExecAsync("ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE");
+        await Schema.InstallAsync(c);
         await new Db(c).ExecAsync("CREATE TABLE dbo.test_effects(job_id bigint NOT NULL,label nvarchar(100) NOT NULL,PRIMARY KEY(job_id,label))");
+    }
+    public static async Task Reinstall()
+    {
+        await using var a = await Host.ConnectAsync(); await using var b = await Host.ConnectAsync();
+        await Task.WhenAll(Schema.InstallAsync(a), Schema.InstallAsync(b));
+        Check.Equal((await new Db(a).QueryAsync("SELECT version FROM resume.schema_version")).Single().Int("version"), Schema.Version);
+        await new Db(a).ExecAsync("UPDATE resume.schema_version SET version=@v", ("v", Schema.Version + 1));
+        try { await SqlError(() => Schema.InstallAsync(a), 50006); }
+        finally { await new Db(a).ExecAsync("UPDATE resume.schema_version SET version=@v", ("v", Schema.Version)); }
+    }
+    public static async Task RunJob()
+    {
+        await using var c = await Host.ConnectAsync(); await using var other = await Host.ConnectAsync(); var db = new Db(c); var name = Name();
+        var first = await Workflow.SubmitAsync(db, name, "first", Json.Null);
+        var second = await Workflow.SubmitAsync(db, name, "second", Json.Value(7));
+        Handler handler = async (job, steps, _) =>
+        {
+            await steps.StepOnceAsync("external", _ => Task.FromResult(Json.Null));
+            return Json.Value(job.Input.GetInt32() * 6);
+        };
+        Check.Equal((await Workflow.GetJobAsync(db, second))!.Status, JobStatus.Ready);
+        Check.That(!await Workflow.RunJobAsync(c, "other-" + name, second, handler, Stop), "Workflow must match");
+        Check.That(await Workflow.RunJobAsync(c, name, second, handler, Stop));
+        var done = (await Workflow.GetJobAsync(db, second))!;
+        Check.Equal(done.Status, JobStatus.Completed); Check.Equal(done.Output!.Value.GetInt32(), 42); Check.Equal(done.UnresolvedSteps.Count, 0);
+        Check.Equal((await Workflow.GetJobAsync(db, first))!.Status, JobStatus.Ready);
+        Check.That(!await Workflow.RunJobAsync(c, name, second, handler, Stop), "Completed jobs are not runnable");
+        Check.That(await Workflow.GetJobAsync(db, long.MaxValue) is null);
+        await new Db(other).ProcAsync("claim", default, ("workflow", name));
+        Check.That(!await Workflow.RunJobAsync(c, name, first, handler, Stop), "Leased jobs are not runnable");
+        Check.Equal((await Workflow.GetJobAsync(db, first))!.Status, JobStatus.Running);
+        name = Name(); var unknown = await Workflow.SubmitAsync(db, name, "unknown", Json.Null);
+        await Check.Throws<IOException>(() => Workflow.RunJobAsync(c, name, unknown, (_, steps, _) => steps.StepOnceAsync("post", _ => throw new IOException("lost")), Stop));
+        var paused = (await Workflow.GetJobAsync(db, unknown))!;
+        Check.Equal(paused.Status, JobStatus.Paused); Check.Equal(paused.LastError, "lost"); Check.Equal(string.Join(",", paused.UnresolvedSteps), "post");
+    }
+    public static async Task DefiniteFailure()
+    {
+        await using var c = await Host.ConnectAsync(); var db = new Db(c); var name = Name(); var id = await Workflow.SubmitAsync(db, name, "key", Json.Null);
+        var calls = 0; JsonElement? detail = null;
+        Handler handler = async (_, steps, _) =>
+        {
+            await steps.StepAsync("before", Null);
+            return await steps.StepOnceAsync("charge", _ => ++calls == 1 ? throw new DefiniteFailureException("declined") : Task.FromResult(Json.Value(calls)));
+        };
+        Handler first = async (_, steps, _) =>
+        {
+            // A caught definite failure may be retried under the same key within the attempt.
+            try { await steps.StepOnceAsync("post", _ => throw new DefiniteFailureException("rejected", Json.Value(new { code = 51 }))); }
+            catch (DefiniteFailureException error) { detail = error.Detail; }
+            return await steps.StepOnceAsync("post", _ => Task.FromResult(Json.Value("posted")));
+        };
+        Check.That(await Workflow.RunOneAsync(c, name, first, Stop));
+        Check.Equal(detail!.Value.GetProperty("code").GetInt32(), 51);
+        Check.Equal((await Workflow.GetJobAsync(db, id))!.Output!.Value.GetString(), "posted");
+        name = Name(); id = await Workflow.SubmitAsync(db, name, "key", Json.Null);
+        await Check.Throws<DefiniteFailureException>(() => Workflow.RunOneAsync(c, name, handler, (_, error) =>
+        { Check.That(error is DefiniteFailureException); return Retry.After(TimeSpan.Zero); }));
+        var retrying = (await Workflow.GetJobAsync(db, id))!;
+        Check.Equal(retrying.Status, JobStatus.Ready); Check.Equal(retrying.UnresolvedSteps.Count, 0);
+        Check.That(await Workflow.RunOneAsync(c, name, handler, Stop));
+        Check.Equal(calls, 2); Check.Equal((await Workflow.GetJobAsync(db, id))!.Output!.Value.GetInt32(), 2);
+    }
+    public static async Task Options()
+    {
+        await using var c = await Host.ConnectAsync(); var db = new Db(c); var name = Name(); var id = await Workflow.SubmitAsync(db, name, "key", Json.Null);
+        var options = new RunOptions { Lease = TimeSpan.FromSeconds(5), StepTimeout = TimeSpan.FromMilliseconds(300), ErrorText = e => e.GetType().Name };
+        await Check.Throws<ArgumentOutOfRangeException>(() => Workflow.RunOneAsync(c, name, (_, _, _) => Task.FromResult(Json.Null), Stop,
+            options with { StepTimeout = TimeSpan.FromSeconds(5) }));
+        DateTime? leasedUntil = null;
+        var started = DateTime.UtcNow;
+        await Check.Throws<TimeoutException>(() => Workflow.RunOneAsync(c, name, async (_, steps, _) =>
+        {
+            leasedUntil = (DateTime?)(await db.QueryAsync("SELECT available_at FROM resume.jobs WHERE id=@id", ("id", id))).Single()["available_at"];
+            // Blocking code: the timeout must still fire.
+            return await steps.StepOnceAsync("blocking", _ => { Thread.Sleep(3000); return Task.FromResult(Json.Null); });
+        }, Stop, options));
+        Check.That(DateTime.UtcNow - started < TimeSpan.FromSeconds(2.5), "Timeout did not interrupt blocking code");
+        var dbNow = (await db.QueryAsync("SELECT SYSUTCDATETIME() AS now")).Single()["now"] as DateTime?;
+        Check.That(leasedUntil - dbNow < TimeSpan.FromSeconds(6), "Lease option ignored");
+        var state = (await Workflow.GetJobAsync(db, id))!;
+        Check.Equal(state.LastError, "TimeoutException"); Check.Equal(state.Status, JobStatus.Paused);
+        name = Name(); id = await Workflow.SubmitAsync(db, name, "key", Json.Null);
+        await Check.Throws<IOException>(() => Workflow.RunOneAsync(c, name, (_, _, _) => throw new IOException("account 1234"), Stop,
+            options with { ErrorText = _ => throw new InvalidOperationException() }));
+        Check.Equal((await Workflow.GetJobAsync(db, id))!.LastError, typeof(IOException).FullName);
     }
     public static async Task Submission()
     {
@@ -192,7 +279,7 @@ public static class Contract
         Handler handler = (_, steps, _) => once ? steps.StepOnceAsync("work", async token =>
         { entered.SetResult(); await Task.Delay(Timeout.Infinite, token); return Json.Null; }) : steps.StepAsync("work", async (tx, token) =>
         { await tx.ExecAsync("INSERT INTO dbo.test_effects VALUES(@id,'cancel')", token, ("id", id)); entered.SetResult(); await Task.Delay(Timeout.Infinite, token); return Json.Null; });
-        var run = Workflow.RunOneAsync(c, name, handler, Stop, stop.Token);
+        var run = Workflow.RunOneAsync(c, name, handler, Stop, ct: stop.Token);
         await entered.Task.WaitAsync(TimeSpan.FromSeconds(10)); await stop.CancelAsync();
         await Check.Throws<OperationCanceledException>(() => run);
         // Dispose completes rollback before observing from a replacement connection.

@@ -63,8 +63,8 @@ public static class Importer
     {
         while (true)
         {
-            var parent = await Workflow.RunOneAsync(c, ImportWorkflow, Import, Host.Retry, ct);
-            var child = await Workflow.RunOneAsync(c, BatchWorkflow, Batch, Host.Retry, ct);
+            var parent = await Workflow.RunOneAsync(c, ImportWorkflow, Import, Host.Retry, ct: ct);
+            var child = await Workflow.RunOneAsync(c, BatchWorkflow, Batch, Host.Retry, ct: ct);
             if (!parent && !child) return;
         }
     }
@@ -86,7 +86,7 @@ public static class Importer
             case ["drain"]: await DrainAsync(c, ct); break;
             case ["work"]:
                 await using (var batches = await Host.ConnectAsync(ct: ct))
-                    await Host.WorkersAsync(ct, token => Workflow.WorkAsync(c, ImportWorkflow, Import, Host.Retry, token), token => Workflow.WorkAsync(batches, BatchWorkflow, Batch, Host.Retry, token));
+                    await Host.WorkersAsync(ct, token => Workflow.WorkAsync(c, ImportWorkflow, Import, Host.Retry, ct: token), token => Workflow.WorkAsync(batches, BatchWorkflow, Batch, Host.Retry, ct: token));
                 break;
             default: throw new ArgumentException("importer init | load KEY FILE | status KEY | drain | work");
         }

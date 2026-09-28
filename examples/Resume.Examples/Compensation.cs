@@ -98,7 +98,7 @@ public static class Compensation
             case ["init"]: await Initialize(connection, provider); break;
             case ["submit", var key, var quantity, var amount]:
                 Console.WriteLine(await Workflow.SubmitAsync(db, Name, key, Json.Value(new { quantity = long.Parse(quantity), amount = long.Parse(amount) }), ct: ct)); break;
-            case ["run"]: Console.WriteLine(await Workflow.RunOneAsync(connection, Name, (job, steps, _) => Fulfill(job, steps, provider), Policy, ct)); break;
+            case ["run"]: Console.WriteLine(await Workflow.RunOneAsync(connection, Name, (job, steps, _) => Fulfill(job, steps, provider), Policy, ct: ct)); break;
             case ["reconcile", var key]: await Reconcile(db, provider, key, ct); Console.WriteLine("Verified; still paused"); break;
             case ["resume", var key]:
                 var job = (await db.QueryAsync("SELECT id FROM resume.jobs WHERE workflow=@workflow AND [key]=@key", ct, ("workflow", Name), ("key", key))).Single();

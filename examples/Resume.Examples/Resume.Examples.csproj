@@ -1,7 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><OutputType>Exe</OutputType></PropertyGroup>
   <ItemGroup>
-    <None Include="../../schema.sql" Link="framework.sql" CopyToOutputDirectory="PreserveNewest" />
     <ProjectReference Include="../../src/Resume/Resume.csproj" />
     <None Include="../orders/*.sql" Link="sql/orders/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
     <None Include="../importer/*.sql" Link="sql/importer/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />

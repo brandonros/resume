@@ -60,8 +60,8 @@ public static class Orders
     {
         while (true)
         {
-            var order = await Workflow.RunOneAsync(connection, OrderWorkflow, Fulfill, Host.Retry, ct);
-            var child = await Workflow.RunOneAsync(connection, ShipWorkflow, Dispatch, Host.Retry, ct);
+            var order = await Workflow.RunOneAsync(connection, OrderWorkflow, Fulfill, Host.Retry, ct: ct);
+            var child = await Workflow.RunOneAsync(connection, ShipWorkflow, Dispatch, Host.Retry, ct: ct);
             if (!order && !child) return;
         }
     }
@@ -77,7 +77,7 @@ public static class Orders
             case ["drain"]: await DrainAsync(connection, ct); break;
             case ["work"]:
                 await using (var ships = await Host.ConnectAsync(ct: ct))
-                    await Host.WorkersAsync(ct, token => Workflow.WorkAsync(connection, OrderWorkflow, Fulfill, Host.Retry, token), token => Workflow.WorkAsync(ships, ShipWorkflow, Dispatch, Host.Retry, token));
+                    await Host.WorkersAsync(ct, token => Workflow.WorkAsync(connection, OrderWorkflow, Fulfill, Host.Retry, ct: token), token => Workflow.WorkAsync(ships, ShipWorkflow, Dispatch, Host.Retry, ct: token));
                 break;
             default: throw new ArgumentException("orders init | stock SKU QUANTITY | submit KEY SKU QUANTITY | status KEY | drain | work");
         }

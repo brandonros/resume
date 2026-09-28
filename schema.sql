@@ -1,4 +1,6 @@
--- SQL Server 2022+ (compatibility level 160). Install into an empty database.
+-- SQL Server 2022+ (compatibility level 160). Re-runnable: Schema.InstallAsync applies it
+-- in one transaction under an application lock. Migrations are forward-only; never edit
+-- a released version block, append a new one and bump Schema.Version.
 -- Procedures join an explicit caller transaction or commit their own transaction.
 -- JSON supplied directly to submit must use the same canonical form as the C# API.
 SET ANSI_NULLS ON;
@@ -9,69 +11,93 @@ SET CONCAT_NULL_YIELDS_NULL ON;
 SET ARITHABORT ON;
 SET NUMERIC_ROUNDABORT OFF;
 GO
-CREATE SCHEMA resume;
+IF SCHEMA_ID(N'resume') IS NULL EXEC(N'CREATE SCHEMA resume');
 GO
-CREATE TABLE resume.jobs (
-    id bigint IDENTITY PRIMARY KEY,
-    workflow nvarchar(128) COLLATE Latin1_General_100_BIN2 NOT NULL CHECK (DATALENGTH(workflow) > 0),
-    [key] nvarchar(512) COLLATE Latin1_General_100_BIN2 NOT NULL CHECK (DATALENGTH([key]) > 0),
-    input nvarchar(max) NOT NULL CHECK (ISJSON(input, VALUE) = 1),
-    parent_id bigint NULL REFERENCES resume.jobs(id),
-    output nvarchar(max) NULL CHECK (output IS NULL OR ISJSON(output, VALUE) = 1),
-    attempt bigint NOT NULL DEFAULT 0,
-    failures bigint NOT NULL DEFAULT 0,
-    leased bit NOT NULL DEFAULT 0,
-    -- NULL represents waiting for a child, not a runnable job.
-    available_at datetime2(7) NULL DEFAULT SYSUTCDATETIME(),
-    completed bit NOT NULL DEFAULT 0,
-    paused bit NOT NULL DEFAULT 0,
-    last_error nvarchar(max) NULL,
-    saga_phase varchar(16) NULL CHECK (saga_phase IN ('forward','compensating','completed','compensated')),
-    saga_position int NULL,
-    saga_result nvarchar(max) NULL CHECK (saga_result IS NULL OR ISJSON(saga_result, VALUE) = 1),
-    -- Hash exact UTF-16 bytes: SQL string equality otherwise ignores trailing spaces.
-    dedup AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(nvarchar(max), DATALENGTH(workflow)) + N':' + workflow + [key])) PERSISTED,
-    CONSTRAINT jobs_dedup UNIQUE (dedup)
-);
-CREATE INDEX jobs_ready ON resume.jobs(workflow, available_at, id) WHERE completed = 0 AND paused = 0;
-CREATE INDEX jobs_parent ON resume.jobs(parent_id);
-CREATE TABLE resume.steps (
-    job_id bigint NOT NULL REFERENCES resume.jobs(id),
-    [key] nvarchar(768) COLLATE Latin1_General_100_BIN2 NOT NULL CHECK (DATALENGTH([key]) > 0),
-    position int NOT NULL CHECK (position >= 0),
-    once bit NOT NULL,
-    compensation nvarchar(512) COLLATE Latin1_General_100_BIN2 NULL CHECK (DATALENGTH(compensation) > 0),
-    is_compensation bit NOT NULL DEFAULT 0,
-    -- SQL NULL is unresolved; the JSON text 'null' is a completed output.
-    output nvarchar(max) NULL CHECK (output IS NULL OR ISJSON(output, VALUE) = 1),
-    key_hash AS CONVERT(binary(32), HASHBYTES('SHA2_256', [key])) PERSISTED,
-    PRIMARY KEY(job_id, position),
-    UNIQUE(job_id, key_hash)
-);
+IF OBJECT_ID(N'resume.schema_version', N'U') IS NULL
+BEGIN
+    CREATE TABLE resume.schema_version (
+        singleton bit NOT NULL PRIMARY KEY DEFAULT 1 CHECK (singleton = 1),
+        version int NOT NULL
+    );
+    -- Installs that predate versioning already hold the version 1 tables.
+    INSERT resume.schema_version(version) VALUES(CASE WHEN OBJECT_ID(N'resume.jobs', N'U') IS NULL THEN 0 ELSE 1 END);
+END;
 GO
-CREATE VIEW resume.job_status AS
+IF (SELECT version FROM resume.schema_version) > 2
+    THROW 50006, 'Database schema is newer than this library', 1;
+GO
+IF (SELECT version FROM resume.schema_version) < 1
+BEGIN
+    CREATE TABLE resume.jobs (
+        id bigint IDENTITY PRIMARY KEY,
+        workflow nvarchar(128) COLLATE Latin1_General_100_BIN2 NOT NULL CHECK (DATALENGTH(workflow) > 0),
+        [key] nvarchar(512) COLLATE Latin1_General_100_BIN2 NOT NULL CHECK (DATALENGTH([key]) > 0),
+        input nvarchar(max) NOT NULL CHECK (ISJSON(input, VALUE) = 1),
+        parent_id bigint NULL REFERENCES resume.jobs(id),
+        output nvarchar(max) NULL CHECK (output IS NULL OR ISJSON(output, VALUE) = 1),
+        attempt bigint NOT NULL DEFAULT 0,
+        failures bigint NOT NULL DEFAULT 0,
+        leased bit NOT NULL DEFAULT 0,
+        -- NULL represents waiting for a child, not a runnable job.
+        available_at datetime2(7) NULL DEFAULT SYSUTCDATETIME(),
+        completed bit NOT NULL DEFAULT 0,
+        paused bit NOT NULL DEFAULT 0,
+        last_error nvarchar(max) NULL,
+        saga_phase varchar(16) NULL CHECK (saga_phase IN ('forward','compensating','completed','compensated')),
+        saga_position int NULL,
+        saga_result nvarchar(max) NULL CHECK (saga_result IS NULL OR ISJSON(saga_result, VALUE) = 1),
+        -- Hash exact UTF-16 bytes: SQL string equality otherwise ignores trailing spaces.
+        dedup AS CONVERT(binary(32), HASHBYTES('SHA2_256', CONVERT(nvarchar(max), DATALENGTH(workflow)) + N':' + workflow + [key])) PERSISTED,
+        CONSTRAINT jobs_dedup UNIQUE (dedup)
+    );
+    CREATE INDEX jobs_ready ON resume.jobs(workflow, available_at, id) WHERE completed = 0 AND paused = 0;
+    CREATE INDEX jobs_parent ON resume.jobs(parent_id);
+    CREATE TABLE resume.steps (
+        job_id bigint NOT NULL REFERENCES resume.jobs(id),
+        [key] nvarchar(768) COLLATE Latin1_General_100_BIN2 NOT NULL CHECK (DATALENGTH([key]) > 0),
+        position int NOT NULL CHECK (position >= 0),
+        once bit NOT NULL,
+        compensation nvarchar(512) COLLATE Latin1_General_100_BIN2 NULL CHECK (DATALENGTH(compensation) > 0),
+        is_compensation bit NOT NULL DEFAULT 0,
+        -- SQL NULL is unresolved; the JSON text 'null' is a completed output.
+        output nvarchar(max) NULL CHECK (output IS NULL OR ISJSON(output, VALUE) = 1),
+        key_hash AS CONVERT(binary(32), HASHBYTES('SHA2_256', [key])) PERSISTED,
+        PRIMARY KEY(job_id, position),
+        UNIQUE(job_id, key_hash)
+    );
+    UPDATE resume.schema_version SET version = 1;
+END;
+GO
+IF (SELECT version FROM resume.schema_version) < 2
+BEGIN
+    ALTER TABLE resume.jobs ADD lease_ms int NOT NULL CONSTRAINT jobs_lease_ms DEFAULT 60000
+        CONSTRAINT jobs_lease_ms_range CHECK (lease_ms BETWEEN 1000 AND 86400000);
+    UPDATE resume.schema_version SET version = 2;
+END;
+GO
+CREATE OR ALTER VIEW resume.job_status AS
 SELECT id, workflow, [key], attempt,
     CASE WHEN completed = 1 THEN 'completed' WHEN paused = 1 THEN 'paused'
          WHEN leased = 1 AND available_at > SYSUTCDATETIME() THEN 'running'
          WHEN leased = 1 THEN 'lease_expired' WHEN available_at IS NULL THEN 'waiting'
          WHEN available_at > SYSUTCDATETIME() THEN 'scheduled' ELSE 'ready' END AS status,
-    available_at, last_error, parent_id, failures, saga_phase, saga_result
+    available_at, last_error, parent_id, failures, saga_phase, saga_result, output
 FROM resume.jobs;
 GO
-CREATE VIEW resume.unresolved_steps AS
+CREATE OR ALTER VIEW resume.unresolved_steps AS
 SELECT j.id AS job_id, j.workflow, j.[key] AS job_key, j.attempt, j.status,
     j.available_at, j.last_error, s.[key] AS step_key, s.position
 FROM resume.job_status j JOIN resume.steps s ON s.job_id = j.id
 WHERE s.once = 1 AND s.output IS NULL;
 GO
-CREATE FUNCTION resume.after_delay(@seconds float) RETURNS datetime2(7) AS
+CREATE OR ALTER FUNCTION resume.after_delay(@seconds float) RETURNS datetime2(7) AS
 BEGIN
     IF @seconds IS NULL OR @seconds < 0 OR @seconds >= DATEDIFF_BIG(SECOND, SYSUTCDATETIME(), CONVERT(datetime2, '9999-12-31')) RETURN NULL;
     RETURN DATEADD(MILLISECOND, CONVERT(int, (@seconds - FLOOR(@seconds / 86400) * 86400) * 1000),
         DATEADD(DAY, CONVERT(int, FLOOR(@seconds / 86400)), SYSUTCDATETIME()));
 END;
 GO
-CREATE PROCEDURE resume.submit @workflow nvarchar(max), @key nvarchar(max), @input nvarchar(max), @available_at datetime2(7) = NULL, @parent_id bigint = NULL AS
+CREATE OR ALTER PROCEDURE resume.submit @workflow nvarchar(max), @key nvarchar(max), @input nvarchar(max), @available_at datetime2(7) = NULL, @parent_id bigint = NULL AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
@@ -103,20 +129,21 @@ BEGIN
     END CATCH;
 END;
 GO
-CREATE PROCEDURE resume.claim @workflow nvarchar(max) AS
+CREATE OR ALTER PROCEDURE resume.claim @workflow nvarchar(max), @lease_ms int = 60000 AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
     DECLARE @own bit = CASE WHEN @@TRANCOUNT = 0 THEN 1 ELSE 0 END;
     IF @own = 1 BEGIN TRANSACTION;
     BEGIN TRY
+        IF @lease_ms IS NULL OR @lease_ms NOT BETWEEN 1000 AND 86400000 THROW 50003, 'Lease must be between 1 second and 1 day', 1;
         ;WITH candidate AS (
             SELECT TOP(1) * FROM resume.jobs WITH (UPDLOCK, READPAST, READCOMMITTEDLOCK)
             WHERE workflow=@workflow COLLATE Latin1_General_100_BIN2 AND DATALENGTH(workflow)=DATALENGTH(@workflow)
                 AND completed=0 AND paused=0 AND available_at<=SYSUTCDATETIME()
             ORDER BY available_at,id
         )
-        UPDATE candidate SET attempt=attempt+1, leased=1, available_at=DATEADD(SECOND,60,SYSUTCDATETIME()) OUTPUT inserted.*;
+        UPDATE candidate SET attempt=attempt+1, leased=1, lease_ms=@lease_ms, available_at=DATEADD(MILLISECOND,@lease_ms,SYSUTCDATETIME()) OUTPUT inserted.*;
         IF @own = 1 COMMIT;
     END TRY
     BEGIN CATCH
@@ -125,14 +152,35 @@ BEGIN
     END CATCH;
 END;
 GO
-CREATE PROCEDURE resume.begin_step @id bigint, @attempt bigint AS
+-- Claims one job by id; READPAST returns nothing while another session holds its row.
+CREATE OR ALTER PROCEDURE resume.claim_job @workflow nvarchar(max), @id bigint, @lease_ms int = 60000 AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
     DECLARE @own bit = CASE WHEN @@TRANCOUNT = 0 THEN 1 ELSE 0 END;
     IF @own = 1 BEGIN TRANSACTION;
     BEGIN TRY
-        UPDATE resume.jobs SET available_at=DATEADD(SECOND,60,SYSUTCDATETIME())
+        IF @lease_ms IS NULL OR @lease_ms NOT BETWEEN 1000 AND 86400000 THROW 50003, 'Lease must be between 1 second and 1 day', 1;
+        UPDATE j SET attempt=attempt+1, leased=1, lease_ms=@lease_ms, available_at=DATEADD(MILLISECOND,@lease_ms,SYSUTCDATETIME()) OUTPUT inserted.*
+        FROM resume.jobs j WITH (UPDLOCK, READPAST, READCOMMITTEDLOCK)
+        WHERE id=@id AND workflow=@workflow COLLATE Latin1_General_100_BIN2 AND DATALENGTH(workflow)=DATALENGTH(@workflow)
+            AND completed=0 AND paused=0 AND available_at<=SYSUTCDATETIME();
+        IF @own = 1 COMMIT;
+    END TRY
+    BEGIN CATCH
+        IF @own = 1 AND XACT_STATE() <> 0 ROLLBACK;
+        THROW;
+    END CATCH;
+END;
+GO
+CREATE OR ALTER PROCEDURE resume.begin_step @id bigint, @attempt bigint AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    DECLARE @own bit = CASE WHEN @@TRANCOUNT = 0 THEN 1 ELSE 0 END;
+    IF @own = 1 BEGIN TRANSACTION;
+    BEGIN TRY
+        UPDATE resume.jobs SET available_at=DATEADD(MILLISECOND,lease_ms,SYSUTCDATETIME())
         WHERE id=@id AND attempt=@attempt AND leased=1 AND completed=0 AND available_at>SYSUTCDATETIME();
         IF @@ROWCOUNT=0 THROW 50001, 'Job claim is no longer valid', 1;
         IF @own = 1 COMMIT;
@@ -143,7 +191,7 @@ BEGIN
     END CATCH;
 END;
 GO
-CREATE PROCEDURE resume.start_step @id bigint, @attempt bigint, @key nvarchar(max), @position int, @once bit, @compensation nvarchar(max) = NULL, @is_compensation bit = 0 AS
+CREATE OR ALTER PROCEDURE resume.start_step @id bigint, @attempt bigint, @key nvarchar(max), @position int, @once bit, @compensation nvarchar(max) = NULL, @is_compensation bit = 0 AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
@@ -185,7 +233,7 @@ BEGIN
     END CATCH;
 END;
 GO
-CREATE PROCEDURE resume.save_step @id bigint, @attempt bigint, @key nvarchar(max), @output nvarchar(max) AS
+CREATE OR ALTER PROCEDURE resume.save_step @id bigint, @attempt bigint, @key nvarchar(max), @output nvarchar(max) AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
@@ -207,7 +255,29 @@ BEGIN
     END CATCH;
 END;
 GO
-CREATE PROCEDURE resume.finish @id bigint, @attempt bigint, @error nvarchar(max) = NULL, @position int = 0, @retry_after_seconds float = NULL, @output nvarchar(max) = NULL AS
+-- A step_once action reported that its effect definitely did not happen: forget the marker.
+CREATE OR ALTER PROCEDURE resume.discard_step @id bigint, @attempt bigint, @key nvarchar(max) AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    DECLARE @own bit = CASE WHEN @@TRANCOUNT = 0 THEN 1 ELSE 0 END;
+    IF @own = 1 BEGIN TRANSACTION;
+    BEGIN TRY
+        IF NOT EXISTS(SELECT 1 FROM resume.jobs WITH (UPDLOCK,HOLDLOCK) WHERE id=@id AND attempt=@attempt AND leased=1 AND completed=0)
+            THROW 50001, 'Job claim is no longer valid', 1;
+        DELETE s FROM resume.steps AS s
+        WHERE s.job_id=@id AND s.key_hash=HASHBYTES('SHA2_256',@key) AND s.once=1 AND s.output IS NULL
+            AND NOT EXISTS(SELECT 1 FROM resume.steps AS later WHERE later.job_id=@id AND later.position>s.position);
+        IF @@ROWCOUNT=0 THROW 50002, 'Only the latest unresolved step_once can be discarded', 1;
+        IF @own = 1 COMMIT;
+    END TRY
+    BEGIN CATCH
+        IF @own = 1 AND XACT_STATE() <> 0 ROLLBACK;
+        THROW;
+    END CATCH;
+END;
+GO
+CREATE OR ALTER PROCEDURE resume.finish @id bigint, @attempt bigint, @error nvarchar(max) = NULL, @position int = 0, @retry_after_seconds float = NULL, @output nvarchar(max) = NULL AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
@@ -243,7 +313,7 @@ BEGIN
     END CATCH;
 END;
 GO
-CREATE PROCEDURE resume.suspend @id bigint, @attempt bigint, @until datetime2(7) AS
+CREATE OR ALTER PROCEDURE resume.suspend @id bigint, @attempt bigint, @until datetime2(7) AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
@@ -266,7 +336,7 @@ BEGIN
     END CATCH;
 END;
 GO
-CREATE PROCEDURE resume.wait_for @id bigint, @attempt bigint, @child bigint AS
+CREATE OR ALTER PROCEDURE resume.wait_for @id bigint, @attempt bigint, @child bigint AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
@@ -291,7 +361,7 @@ BEGIN
     END CATCH;
 END;
 GO
-CREATE PROCEDURE resume.resolve_step @id bigint, @key nvarchar(max), @output nvarchar(max) AS
+CREATE OR ALTER PROCEDURE resume.resolve_step @id bigint, @key nvarchar(max), @output nvarchar(max) AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
@@ -312,7 +382,7 @@ BEGIN
     END CATCH;
 END;
 GO
-CREATE PROCEDURE resume.requeue @id bigint, @delay_seconds float = 0 AS
+CREATE OR ALTER PROCEDURE resume.requeue @id bigint, @delay_seconds float = 0 AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
@@ -335,7 +405,7 @@ BEGIN
     END CATCH;
 END;
 GO
-CREATE PROCEDURE resume.begin_saga @id bigint, @attempt bigint AS
+CREATE OR ALTER PROCEDURE resume.begin_saga @id bigint, @attempt bigint AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
@@ -357,7 +427,7 @@ BEGIN
     END CATCH;
 END;
 GO
-CREATE PROCEDURE resume.compensate @id bigint, @attempt bigint, @position int, @reason nvarchar(max) AS
+CREATE OR ALTER PROCEDURE resume.compensate @id bigint, @attempt bigint, @position int, @reason nvarchar(max) AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
@@ -378,7 +448,7 @@ BEGIN
     END CATCH;
 END;
 GO
-CREATE PROCEDURE resume.end_saga @id bigint, @attempt bigint, @position int, @output nvarchar(max) AS
+CREATE OR ALTER PROCEDURE resume.end_saga @id bigint, @attempt bigint, @position int, @output nvarchar(max) AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;

@@ -35,7 +35,9 @@ if (args.Contains("--database"))
 {
     if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("RESUME_CONNECTION_STRING")))
         throw new InvalidOperationException("--database requires RESUME_CONNECTION_STRING pointing to a disposable empty SQL Server database");
-    await Contract.Install();
+    // --rcsi turns on READ_COMMITTED_SNAPSHOT first (the Azure SQL Database default); it needs ALTER DATABASE permission.
+    await Contract.Install(args.Contains("--rcsi"));
+    await Test("schema install is idempotent, concurrent and versioned", Contract.Reinstall);
     await Test("submission identity and caller rollback", Contract.Submission);
     await Test("transactional effects and durable replay", Contract.Replay);
     await Test("claim contention and stale fencing", Contract.Claims);
@@ -50,6 +52,9 @@ if (args.Contains("--database"))
     await Test("cancellation preserves an at-most-once marker", Contract.OnceCancellation);
     await Test("saga success and reverse compensation replay", Contract.Sagas);
     await Test("saga unknown outcome blocks compensation", Contract.SagaUnknown);
+    await Test("run a specific job and read its state", Contract.RunJob);
+    await Test("definite step_once failure discards the marker", Contract.DefiniteFailure);
+    await Test("lease, step timeout and error text options", Contract.Options);
     await Test("parallel workers drain each job once", Contract.Stress);
     await Test("application examples: orders and import", Contract.Applications);
     await Test("saga example: uncertain charge and refund retry", Contract.CompensationExample);

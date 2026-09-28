@@ -16,7 +16,7 @@ public static class Demos
                 var name = Host.Text(job.Input, "name");
                 await tx.ExecAsync("INSERT INTO dbo.greetings VALUES(@id,@name)", token, ("id", job.Id), ("name", name));
                 return Json.Value(new { greeted = name });
-            }), Host.Retry, ct);
+            }), Host.Retry, ct: ct);
     }
     public static async Task Flow(CancellationToken ct)
     {
@@ -35,15 +35,15 @@ public static class Demos
                 var receipts = new List<System.Text.Json.JsonElement>();
                 foreach (var id in children) receipts.Add(await steps.WaitForAsync(id));
                 return Json.Value(receipts);
-            }, Host.Retry, token),
-            token => Workflow.WorkAsync(child, "flow-ship", (job, steps, _) => steps.StepAsync("ship", (_, _) => Task.FromResult(Json.Value(new { shipped = job.Input }))), Host.Retry, token),
+            }, Host.Retry, ct: token),
+            token => Workflow.WorkAsync(child, "flow-ship", (job, steps, _) => steps.StepAsync("ship", (_, _) => Task.FromResult(Json.Value(new { shipped = job.Input }))), Host.Retry, ct: token),
             token => Workflow.WorkAsync(ticks, "tick", (job, steps, _) => steps.StepAsync("schedule-next", async (tx, cancellation) =>
             {
                 var next = job.Input.GetInt64() + 5;
                 await Workflow.SubmitAsync(tx, "tick", next.ToString(), Json.Value(next), DateTimeOffset.FromUnixTimeSeconds(next), ct: cancellation);
                 Console.WriteLine($"tick {job.Input}");
                 return Json.Value(next);
-            }), Host.Retry, token));
+            }), Host.Retry, ct: token));
     }
     public static async Task Recovery(CancellationToken ct)
     {
@@ -59,14 +59,14 @@ public static class Demos
             await external.ExecAsync("INSERT INTO #charges(job_id) VALUES(@id)", token, ("id", id));
             throw new IOException("Charge committed, response lost");
         });
-        try { await Workflow.RunOneAsync(worker, workflow, checkout, (_, _) => Retry.Stop, ct); throw new InvalidOperationException("Expected lost response"); }
+        try { await Workflow.RunOneAsync(worker, workflow, checkout, (_, _) => Retry.Stop, ct: ct); throw new InvalidOperationException("Expected lost response"); }
         catch (IOException) { }
         try { await Workflow.RequeueAsync(db, id, ct: ct); throw new InvalidOperationException("Unresolved action must block requeue"); }
         catch (Microsoft.Data.SqlClient.SqlException e) when (e.Number == 50004) { }
         var verified = (await external.QueryAsync("SELECT id FROM #charges WHERE job_id=@id", ct, ("id", id))).Single();
         await Workflow.ResolveStepAsync(db, id, "charge", Json.Value(new { charge_id = verified.Long("id") }), ct);
         await Workflow.RequeueAsync(db, id, ct: ct);
-        await Workflow.RunOneAsync(worker, workflow, checkout, (_, _) => Retry.Stop, ct);
+        await Workflow.RunOneAsync(worker, workflow, checkout, (_, _) => Retry.Stop, ct: ct);
         Host.Check((await external.QueryAsync("SELECT id FROM #charges", ct)).Count == 1, "Charge repeated");
         Console.WriteLine($"Job {id}: reconciled and completed with one charge invocation.");
     }
