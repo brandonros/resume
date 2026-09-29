@@ -1,17 +1,20 @@
-create schema if not exists orders_app;
-create table if not exists orders_app.inventory (
-    sku text primary key check (sku <> ''),
-    available bigint not null check (available >= 0)
+IF SCHEMA_ID('orders_app') IS NULL EXEC('CREATE SCHEMA orders_app');
+GO
+IF OBJECT_ID('orders_app.inventory') IS NULL
+CREATE TABLE orders_app.inventory (
+    sku nvarchar(256) COLLATE Latin1_General_100_BIN2 PRIMARY KEY,
+    available bigint NOT NULL CHECK (available>=0)
 );
-create table if not exists orders_app.orders (
-    key text primary key check (key <> ''),
-    sku text not null check (sku <> ''),
-    quantity bigint not null check (quantity > 0),
-    status text not null default 'pending' check (status in ('pending', 'reserved', 'rejected', 'shipped')),
-    job_id bigint not null unique references resume.jobs(id)
+IF OBJECT_ID('orders_app.orders') IS NULL
+CREATE TABLE orders_app.orders (
+    [key] nvarchar(512) COLLATE Latin1_General_100_BIN2 NOT NULL PRIMARY KEY NONCLUSTERED,
+    sku nvarchar(256) COLLATE Latin1_General_100_BIN2 NOT NULL,
+    quantity bigint NOT NULL CHECK (quantity>0),
+    status varchar(16) NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','reserved','rejected','shipped')),
+    job_id bigint NOT NULL UNIQUE REFERENCES resume.jobs(id)
 );
--- Local dispatch ledger for this application, not a real carrier integration.
-create table if not exists orders_app.shipments (
-    order_key text primary key references orders_app.orders(key),
-    receipt text not null unique
+IF OBJECT_ID('orders_app.shipments') IS NULL
+CREATE TABLE orders_app.shipments (
+    order_key nvarchar(512) COLLATE Latin1_General_100_BIN2 NOT NULL PRIMARY KEY NONCLUSTERED REFERENCES orders_app.orders([key]),
+    receipt nvarchar(100) NOT NULL UNIQUE
 );

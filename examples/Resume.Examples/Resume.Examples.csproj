@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType></PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/Resume/Resume.csproj" />
+    <None Include="../orders/*.sql" Link="sql/orders/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../importer/*.sql" Link="sql/importer/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../compensation/*.sql" Link="sql/compensation/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../importer/sample.jsonl" Link="sample.jsonl" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

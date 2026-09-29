@@ -1,14 +1,16 @@
--- Fake payment provider. Run through a separate connection/database, never the step transaction.
--- Each row represents one completed effect, with a stable idempotency key and immutable parameters.
-create schema if not exists payment_provider;
-create table if not exists payment_provider.charges (
-    key text primary key,
-    amount bigint not null check (amount > 0),
-    calls bigint not null default 1
+-- Fake provider: separate connection/database, with its own transactions and idempotency keys.
+IF SCHEMA_ID('payment_provider') IS NULL EXEC('CREATE SCHEMA payment_provider');
+GO
+IF OBJECT_ID('payment_provider.charges') IS NULL
+CREATE TABLE payment_provider.charges (
+    [key] nvarchar(512) COLLATE Latin1_General_100_BIN2 NOT NULL PRIMARY KEY NONCLUSTERED,
+    amount bigint NOT NULL CHECK(amount>0),
+    calls bigint NOT NULL DEFAULT 1
 );
-create table if not exists payment_provider.refunds (
-    key text primary key,
-    charge_key text not null unique references payment_provider.charges(key),
-    amount bigint not null check (amount > 0),
-    calls bigint not null default 1
+IF OBJECT_ID('payment_provider.refunds') IS NULL
+CREATE TABLE payment_provider.refunds (
+    [key] nvarchar(512) COLLATE Latin1_General_100_BIN2 NOT NULL PRIMARY KEY NONCLUSTERED,
+    charge_key nvarchar(512) COLLATE Latin1_General_100_BIN2 NOT NULL UNIQUE REFERENCES payment_provider.charges([key]),
+    amount bigint NOT NULL CHECK(amount>0),
+    calls bigint NOT NULL DEFAULT 1
 );
